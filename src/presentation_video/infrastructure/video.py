@@ -8,10 +8,13 @@ from presentation_video.domain.models import (
     SceneArtifact,
     SlideContent,
     VisualArtifact,
+    VisualBeatKind,
+    VisualScenePlan,
 )
 from presentation_video.domain.ports import SceneRenderer, VideoAssembler
 from presentation_video.infrastructure.process import run_process
 from presentation_video.infrastructure.speech import media_duration
+from presentation_video.infrastructure.visual_media import _local_motion_filter
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +33,33 @@ class FfmpegSceneRenderer(SceneRenderer):
         output_path: Path,
         presenter_video: Path | None = None,
         visual: VisualArtifact | None = None,
+        visual_image: VisualArtifact | None = None,
+        visual_plan: VisualScenePlan | None = None,
     ) -> SceneArtifact:
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        target_duration = max(audio.duration_seconds, 0.1)
+        if (
+            presenter_video is None
+            and visual_plan is not None
+            and visual_plan.visual_beats
+        ):
+            return await self._render_visual_beats(
+                scene_number=scene_number,
+                source_slide=source_slide,
+                audio=audio,
+                output_path=output_path,
+                visual=visual,
+                visual_image=visual_image,
+                visual_plan=visual_plan,
+            )
+        transition_duration = min(0.28, target_duration / 4)
+        fade_out_start = max(target_duration - transition_duration, 0)
         base_filter = (
             f"scale={self._width}:{self._height}:force_original_aspect_ratio=decrease,"
-            f"pad={self._width}:{self._height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+            f"pad={self._width}:{self._height}:(ow-iw)/2:(oh-ih)/2,"
+            f"fade=t=in:st=0:d={transition_duration:.3f},"
+            f"fade=t=out:st={fade_out_start:.3f}:d={transition_duration:.3f},format=yuv420p"
         )
-        target_duration = max(audio.duration_seconds, 0.1)
 
         visual = visual or VisualArtifact(
             scene_number=scene_number,
@@ -172,6 +195,139 @@ class FfmpegSceneRenderer(SceneRenderer):
                 str(output_path),
             )
 
+        return SceneArtifact(
+            scene_number=scene_number,
+            path=output_path,
+            duration_seconds=await media_duration(output_path),
+        )
+
+    async def _render_visual_beats(
+        self,
+        *,
+        scene_number: int,
+        source_slide: SlideContent,
+        audio: AudioArtifact,
+        output_path: Path,
+        visual: VisualArtifact | None,
+        visual_image: VisualArtifact | None,
+        visual_plan: VisualScenePlan,
+    ) -> SceneArtifact:
+        target_duration = max(audio.duration_seconds, 0.1)
+        beats = list(visual_plan.visual_beats)
+        planned_duration = sum(beat.duration_seconds for beat in beats)
+        if planned_duration < target_duration:
+            beats[-1] = beats[-1].model_copy(
+                update={
+                    "duration_seconds": beats[-1].duration_seconds
+                    + target_duration
+                    - planned_duration
+                }
+            )
+
+        input_args: list[str] = []
+        filters: list[str] = []
+        labels: list[str] = []
+        for index, beat in enumerate(beats):
+            duration = beat.duration_seconds
+            if (
+                beat.kind == VisualBeatKind.GENERATED_VIDEO
+                and visual is not None
+                and visual.kind == "video"
+            ):
+                path = visual.path
+                input_args.extend(["-i", str(path)])
+                filters.append(
+                    f"[{index}:v]scale={self._width}:{self._height}:"
+                    "force_original_aspect_ratio=decrease,"
+                    f"pad={self._width}:{self._height}:(ow-iw)/2:(oh-ih)/2,"
+                    f"trim=duration={duration:.3f},setpts=PTS-STARTPTS,"
+                    f"fps={self._fps},setsar=1,settb=AVTB,format=yuv420p[v{index}]"
+                )
+            else:
+                use_generated_image = beat.kind in {
+                    VisualBeatKind.GENERATED_IMAGE,
+                    VisualBeatKind.MOTION_GRAPHIC,
+                }
+                image_path = (
+                    visual_image.path
+                    if use_generated_image and visual_image is not None
+                    else source_slide.image_path
+                )
+                input_args.extend(
+                    [
+                        "-loop",
+                        "1",
+                        "-framerate",
+                        str(self._fps),
+                        "-i",
+                        str(image_path),
+                    ]
+                )
+                if beat.motion_preset.value == "none":
+                    image_filter = (
+                        f"scale={self._width}:{self._height}:"
+                        "force_original_aspect_ratio=decrease,"
+                        f"pad={self._width}:{self._height}:(ow-iw)/2:(oh-ih)/2"
+                    )
+                else:
+                    frames = max(round(duration * self._fps), 1)
+                    motion = _local_motion_filter(beat.motion_preset.value, frames)
+                    image_filter = (
+                        "scale=2048:1152:force_original_aspect_ratio=increase,"
+                        f"crop=2048:1152,{motion}:d=1:s={self._width}x{self._height}:"
+                        f"fps={self._fps}"
+                    )
+                filters.append(
+                    f"[{index}:v]{image_filter},trim=duration={duration:.3f},"
+                    f"setpts=PTS-STARTPTS,fps={self._fps},setsar=1,settb=AVTB,"
+                    f"format=yuv420p[v{index}]"
+                )
+            labels.append(f"[v{index}]")
+
+        audio_index = len(beats)
+        input_args.extend(["-i", str(audio.path)])
+        transition_duration = min(0.28, target_duration / 4)
+        fade_out_start = max(target_duration - transition_duration, 0)
+        filters.append(
+            "".join(labels)
+            + f"concat=n={len(beats)}:v=1:a=0,"
+            + f"fade=t=in:st=0:d={transition_duration:.3f},"
+            + f"fade=t=out:st={fade_out_start:.3f}:d={transition_duration:.3f}[outv]"
+        )
+        await run_process(
+            "ffmpeg",
+            "-y",
+            *input_args,
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[outv]",
+            "-map",
+            f"{audio_index}:a:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-r",
+            str(self._fps),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-t",
+            f"{target_duration:.3f}",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        )
+        logger.info(
+            "scene visual beat timeline rendered scene=%s beats=%s duration_seconds=%.3f",
+            scene_number,
+            len(beats),
+            target_duration,
+        )
         return SceneArtifact(
             scene_number=scene_number,
             path=output_path,

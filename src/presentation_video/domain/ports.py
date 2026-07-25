@@ -89,6 +89,8 @@ class SceneRenderer(Protocol):
         output_path: Path,
         presenter_video: Path | None = None,
         visual: VisualArtifact | None = None,
+        visual_image: VisualArtifact | None = None,
+        visual_plan: VisualScenePlan | None = None,
     ) -> SceneArtifact: ...
 
 

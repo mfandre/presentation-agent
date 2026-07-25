@@ -48,6 +48,10 @@ export class HttpVideoGateway implements VideoGateway {
     return this.request<VideoJob>(`/v1/videos/${jobId}/approve-visuals`, { method: "POST" });
   }
 
+  async resumeVideo(jobId: string): Promise<VideoJob> {
+    return this.request<VideoJob>(`/v1/videos/${jobId}/resume`, { method: "POST" });
+  }
+
   assetUrl(path: string): string {
     if (/^https?:\/\//i.test(path)) {
       return path;

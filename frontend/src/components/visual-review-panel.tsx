@@ -54,8 +54,11 @@ export function VisualReviewPanel({
     return firstScene ? { [firstScene]: true } : {};
   });
 
-  const staticCount = job.scene_images.filter((scene) => scene.media_mode === "static").length;
-  const videoCount = job.scene_images.length - staticCount;
+  const staticCount = job.scene_images.filter((scene) => scene.preserve_source_frame).length;
+  const illustrationCount = job.scene_images.filter(
+    (scene) => scene.media_mode === "static" && !scene.preserve_source_frame,
+  ).length;
+  const videoCount = job.scene_images.filter((scene) => scene.media_mode === "video").length;
 
   const toggleEditor = (sceneNumber: number) => {
     setOpenEditors((current) => ({
@@ -77,8 +80,55 @@ export function VisualReviewPanel({
 
       <div className="visual-review__tip">
         <Sparkles size={17} />
-        <span><strong>{job.debug_mode ? "Modo debug ativo." : "Ritmo editorial planejado."}</strong> {job.debug_mode ? "As páginas originais são usadas como frames e nenhuma regeneração chama APIs pagas." : `${staticCount} slides manterão o texto intacto e ${videoCount} cenas usarão movimento sem palavras.`}</span>
+        <span><strong>{job.debug_mode ? "Modo debug ativo." : "Ritmo editorial planejado."}</strong> {job.debug_mode ? "Nenhuma regeneração chama APIs pagas." : `${staticCount} páginas visuais serão preservadas, ${illustrationCount} cenas terão ilustrações editoriais e ${videoCount} cenas usarão movimento sem palavras.`}</span>
       </div>
+
+      {job.creative_direction && (
+        <section className="creative-direction-card">
+          <div>
+            <span>Direção criativa</span>
+            <h3>{job.creative_direction.hook_question || "Narrativa editorial integrada"}</h3>
+            <p>{job.creative_direction.throughline}</p>
+            {job.creative_direction.central_thesis && (
+              <p><strong>Tese central:</strong> {job.creative_direction.central_thesis}</p>
+            )}
+          </div>
+          <dl>
+            {job.creative_direction.narrative_device && (
+              <div><dt>Dispositivo narrativo</dt><dd>{job.creative_direction.narrative_device}</dd></div>
+            )}
+            {job.creative_direction.transformation_from && job.creative_direction.transformation_to && (
+              <div>
+                <dt>Transformação</dt>
+                <dd>{job.creative_direction.transformation_from} → {job.creative_direction.transformation_to}</dd>
+              </div>
+            )}
+            {job.creative_direction.recurring_visual_principle && (
+              <div>
+                <dt>Princípio recorrente</dt>
+                <dd>{job.creative_direction.recurring_visual_principle}</dd>
+              </div>
+            )}
+            <div><dt>Motivo visual</dt><dd>{job.creative_direction.visual_motif}</dd></div>
+            <div><dt>Ritmo</dt><dd>{job.creative_direction.pacing}</dd></div>
+            <div><dt>Acento</dt><dd>{job.creative_direction.accent_color}</dd></div>
+            {job.creative_direction.reveal_scene_number && (
+              <div><dt>Revelação</dt><dd>Cena {job.creative_direction.reveal_scene_number}</dd></div>
+            )}
+          </dl>
+          {(job.creative_direction.concept_mappings ?? []).length > 0 && (
+            <div className="visual-card__concepts">
+              <strong>Correspondências da narrativa</strong>
+              {(job.creative_direction.concept_mappings ?? []).map((mapping, index) => (
+                <small key={`${mapping.source_concept}-${mapping.target_concept}-${index}`}>
+                  {mapping.source_concept} → {mapping.target_concept}
+                  {mapping.narrative_meaning ? ` — ${mapping.narrative_meaning}` : ""}
+                </small>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
 
       {error && <div className="visual-review__error" role="alert">{error}</div>}
 
@@ -100,9 +150,11 @@ export function VisualReviewPanel({
                 <small>versão {scene.revision}</small>
                 <em className={`visual-card__mode visual-card__mode--${scene.media_mode}`}>
                   {isVideo ? <Clapperboard size={13} /> : <FileText size={13} />}
-                  {isVideo ? "Vídeo sem texto" : "Slide fixo"}
+                  {isVideo
+                    ? "Vídeo sem texto"
+                    : scene.preserve_source_frame ? "Slide fixo" : "Ilustração editorial"}
                 </em>
-                {isVideo ? <button
+                {(isVideo || !scene.preserve_source_frame) ? <button
                   className="visual-card__edit"
                   type="button"
                   aria-expanded={editorOpen}
@@ -115,7 +167,7 @@ export function VisualReviewPanel({
                   Texto preservado da página {scene.source_slide_number ?? scene.source_slide_numbers[0]}
                 </div>}
               </div>
-              {isVideo && editorOpen && <div className="visual-card__body" id={editorId}>
+              {(isVideo || !scene.preserve_source_frame) && editorOpen && <div className="visual-card__body" id={editorId}>
                 <div className="visual-card__editor-heading">
                   <div>
                     <strong>Personalize a imagem da cena {scene.scene_number}</strong>
@@ -139,7 +191,32 @@ export function VisualReviewPanel({
                     }))}
                   />
                 </label>
-                <span><Sparkles size={13} /> {scene.camera_motion}</span>
+                {(scene.must_show_concepts ?? []).length > 0 && (
+                  <div className="visual-card__concepts">
+                    <strong>Conceitos obrigatórios</strong>
+                    <span>{scene.must_show_concepts.join(" · ")}</span>
+                    {scene.concept_visualization && <small>{scene.concept_visualization}</small>}
+                  </div>
+                )}
+                {scene.relationship_to_thesis && (
+                  <div className="visual-card__concepts">
+                    <strong>Função na narrativa</strong>
+                    <span>{scene.scene_purpose}</span>
+                    <small>{scene.relationship_to_thesis}</small>
+                    {scene.narrative_progress && <small>Avanço: {scene.narrative_progress}</small>}
+                  </div>
+                )}
+                <span><Sparkles size={13} /> {scene.camera_motion} · {scene.motion_preset.replaceAll("_", " ")}</span>
+                <span><Clapperboard size={13} /> {scene.entrance_motion} → {scene.transition_out}</span>
+                {(scene.visual_beats ?? []).length > 0 && (
+                  <div className="visual-beat-strip">
+                    {(scene.visual_beats ?? []).map((beat) => (
+                      <span key={beat.beat_number}>
+                        {beat.kind.replaceAll("_", " ")} · {Math.round(beat.duration_seconds)}s
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <button
                   className="secondary-button visual-card__action"
                   type="button"
@@ -156,7 +233,7 @@ export function VisualReviewPanel({
       </div>
 
       <div className="visual-review__approval">
-        <div><CheckCircle2 size={20} /><span><strong>{staticCount} slides fixos + {videoCount} vídeos</strong>O resultado preservará os textos e animará somente as cenas sem palavras.</span></div>
+        <div><CheckCircle2 size={20} /><span><strong>{staticCount} páginas + {illustrationCount} ilustrações + {videoCount} vídeos</strong>Páginas de texto corrido serão substituídas por imagens baseadas no storytelling.</span></div>
         <button className="primary-button" type="button" disabled={isActing} onClick={() => void onApprove()}>
           {isActing ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
           Aprovar e gerar vídeo

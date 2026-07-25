@@ -9,7 +9,7 @@ import { VisualReviewPanel } from "./components/visual-review-panel";
 import { useVideoCreation } from "./hooks/use-video-creation";
 
 export default function App() {
-  const { job, debugMode, debugMaxScenes, isSubmitting, isActing, error, createVideo, regenerateScene, approveVisuals, reset, assetUrl } = useVideoCreation();
+  const { job, debugMode, debugMaxScenes, isSubmitting, isActing, error, createVideo, regenerateScene, approveVisuals, resumeVideo, reset, assetUrl } = useVideoCreation();
   const isRunning = Boolean(job && !["completed", "failed"].includes(job.status));
 
   return (
@@ -42,7 +42,12 @@ export default function App() {
 
         <section className="studio-grid">
           <aside className="configuration-card">
-            <ConfigurationForm disabled={isSubmitting || isRunning} onSubmit={createVideo} />
+            <ConfigurationForm
+              disabled={isSubmitting || isRunning}
+              isResuming={isActing}
+              onSubmit={createVideo}
+              onResume={resumeVideo}
+            />
           </aside>
           <section className="workspace-card" aria-live="polite">
             {!job && !error && <EmptyPreview />}
@@ -52,7 +57,7 @@ export default function App() {
             )}
             {job?.status === "completed" && <ResultPanel job={job} assetUrl={assetUrl} onReset={reset} />}
             {!job && error && <ErrorPanel message={error} onReset={reset} />}
-            {job?.status === "failed" && <ErrorPanel message={job.detail || error || "Erro inesperado."} onReset={reset} />}
+            {job?.status === "failed" && <ErrorPanel message={error || job.detail || "Erro inesperado."} isActing={isActing} onResume={resumeVideo} onReset={reset} />}
           </section>
         </section>
 

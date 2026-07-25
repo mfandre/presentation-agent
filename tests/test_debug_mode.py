@@ -112,3 +112,5 @@ async def test_debug_storyboard_combines_video_and_static_scenes() -> None:
     ]
     assert script.scenes[0].story_beat == "opening"
     assert script.scenes[-1].story_beat == "conclusion"
+    assert script.creative_direction.hook_question
+    assert script.creative_direction.reveal_scene_number == len(script.scenes)

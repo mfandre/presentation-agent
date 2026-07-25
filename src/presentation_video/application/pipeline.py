@@ -4,17 +4,21 @@ import asyncio
 import json
 import logging
 import uuid
+import wave
 from pathlib import Path
 
 from presentation_video.domain.models import (
     AudioArtifact,
     JobStatus,
     MediaMode,
+    PresentationScript,
+    PresentationVisualPlan,
     PreparedVideoJob,
     SceneArtifact,
     VideoJobRequest,
     VideoJobResult,
     VisualArtifact,
+    build_default_visual_beats,
 )
 from presentation_video.domain.ports import (
     AvatarRenderer,
@@ -28,6 +32,7 @@ from presentation_video.domain.ports import (
     VisualAssetGenerator,
     VisualPlanner,
 )
+from presentation_video.infrastructure.visual_planning import _validate_sequence
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +69,100 @@ class CreatePresentationVideo:
         self._work_root = work_root
         self._output_root = output_root
         self._semaphore = asyncio.Semaphore(max_parallel_scenes)
+
+    async def restore(
+        self, request: VideoJobRequest, job_id: str
+    ) -> PreparedVideoJob:
+        """Rebuild a prepared job, generating only visual artifacts missing from its checkpoint."""
+        work_dir = self._work_root / job_id
+        output_dir = self._output_root / job_id
+        script_path = output_dir / "script.json"
+        visual_plan_path = output_dir / "visual-plan.json"
+        if not request.source_path.is_file():
+            raise FileNotFoundError(f"Source file not found for job {job_id}")
+        if not script_path.is_file() or not visual_plan_path.is_file():
+            raise FileNotFoundError(f"Job {job_id} has not completed visual preparation")
+
+        document = await self._ingestor_factory.create(request.source_path).ingest(
+            request.source_path, work_dir
+        )
+        script = PresentationScript.model_validate_json(script_path.read_text(encoding="utf-8"))
+        visual_plan = PresentationVisualPlan.model_validate_json(
+            visual_plan_path.read_text(encoding="utf-8")
+        )
+        _validate_sequence(visual_plan, script, document)
+        visual_plan_path.write_text(
+            visual_plan.model_dump_json(indent=2),
+            encoding="utf-8",
+        )
+        slides = {slide.number: slide for slide in document.slides}
+        scripts = {scene.scene_number: scene for scene in script.scenes}
+        images: list[VisualArtifact] = []
+        completed_images = 0
+        for plan in visual_plan.scenes:
+            if plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
+                source_number = plan.source_slide_number or plan.source_slide_numbers[0]
+                try:
+                    image_path = slides[source_number].image_path
+                except KeyError as exc:
+                    raise FileNotFoundError(
+                        f"Source slide {source_number} is unavailable for scene {plan.scene_number}"
+                    ) from exc
+                revision = 1
+            else:
+                candidates = sorted(
+                    (work_dir / "images").glob(f"scene-{plan.scene_number:03d}-r*.*")
+                )
+                if not candidates:
+                    scene_script = scripts[plan.scene_number]
+                    source_slides = [
+                        slides[number] for number in scene_script.source_slide_numbers
+                    ]
+                    logger.info(
+                        "job=%s restoring missing generated image scene=%s",
+                        job_id,
+                        plan.scene_number,
+                    )
+                    image = await self._visual_asset_generator.generate(
+                        plan,
+                        source_slides,
+                        work_dir / "images",
+                    )
+                    image_path = image.path
+                    revision = image.revision
+                else:
+                    image_path = candidates[-1]
+                    match = image_path.stem.rsplit("-r", 1)
+                    revision = (
+                        int(match[1]) if len(match) == 2 and match[1].isdigit() else 1
+                    )
+            artifact = VisualArtifact(
+                scene_number=plan.scene_number,
+                path=image_path,
+                kind="image",
+                revision=revision,
+            )
+            images.append(artifact)
+            completed_images += 1
+            await self._reporter.update(
+                job_id,
+                JobStatus.GENERATING_IMAGES,
+                f"completed={completed_images} total={len(visual_plan.scenes)}"
+                f" | frame da cena {plan.scene_number} recuperado",
+            )
+
+        return PreparedVideoJob(
+            job_id=job_id,
+            request=request,
+            document=document,
+            script=script,
+            visual_plan=visual_plan,
+            visual_images=images,
+            work_dir=work_dir,
+            output_dir=output_dir,
+            script_path=script_path,
+            visual_plan_path=visual_plan_path,
+        )
 
     async def prepare(
         self, request: VideoJobRequest, job_id: str | None = None
@@ -150,7 +249,7 @@ class CreatePresentationVideo:
                         scene_script.source_slide_numbers,
                     )
                     plan = plans[scene_number]
-                    if plan.media_mode == MediaMode.STATIC:
+                    if plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
                         selected_number = plan.source_slide_number or scene_sources[0].number
                         selected_slide = source_slides[selected_number]
                         image = VisualArtifact(
@@ -226,7 +325,10 @@ class CreatePresentationVideo:
         images = {image.scene_number: image for image in prepared.visual_images}
         if scene_number not in scripts or scene_number not in plans or scene_number not in images:
             raise ValueError(f"Scene {scene_number} does not exist")
-        if plans[scene_number].media_mode == MediaMode.STATIC:
+        if (
+            plans[scene_number].media_mode == MediaMode.STATIC
+            and plans[scene_number].preserve_source_frame
+        ):
             raise ValueError(
                 "Static scenes preserve an original source page and cannot be regenerated "
                 "from a prompt"
@@ -278,6 +380,13 @@ class CreatePresentationVideo:
         source_slides = {slide.number: slide for slide in prepared.document.slides}
         scripts = {item.scene_number: item for item in prepared.script.scenes}
         plans = {item.scene_number: item for item in prepared.visual_plan.scenes}
+        for scene_number, plan in plans.items():
+            if not plan.visual_beats:
+                plan.visual_beats = build_default_visual_beats(
+                    scripts[scene_number].target_seconds,
+                    is_video=plan.media_mode == MediaMode.VIDEO,
+                    motion_preset=plan.motion_preset,
+                )
         images = {item.scene_number: item for item in prepared.visual_images}
         try:
             logger.info("job=%s finalization started approved_images=%s", job_id, len(images))
@@ -292,12 +401,25 @@ class CreatePresentationVideo:
                 nonlocal completed_audio
                 async with self._semaphore:
                     logger.info("job=%s speech synthesis started scene=%s", job_id, scene_number)
-                    audio = await self._speech_synthesizer.synthesize(
-                        scripts[scene_number].narration,
-                        prepared.work_dir / "audio" / f"scene-{scene_number:03d}.wav",
-                        language=prepared.request.language,
-                        style=prepared.request.tone,
+                    audio_path = (
+                        prepared.work_dir / "audio" / f"scene-{scene_number:03d}.wav"
                     )
+                    duration = _valid_wav_duration(audio_path)
+                    if duration is None:
+                        audio = await self._speech_synthesizer.synthesize(
+                            scripts[scene_number].narration,
+                            audio_path,
+                            language=prepared.request.language,
+                            style=prepared.request.tone,
+                        )
+                    else:
+                        audio = AudioArtifact(path=audio_path, duration_seconds=duration)
+                        logger.info(
+                            "job=%s speech synthesis reused scene=%s path=%s",
+                            job_id,
+                            scene_number,
+                            audio_path,
+                        )
                     presenter = await self._avatar_renderer.render(
                         prepared.request.avatar_reference,
                         audio,
@@ -340,35 +462,63 @@ class CreatePresentationVideo:
                     if plan.media_mode == MediaMode.STATIC:
                         clip = images[scene_number]
                         logger.info(
-                            "job=%s image-to-video skipped scene=%s reason=static_source_frame",
+                            "job=%s image-to-video skipped scene=%s reason=static_image",
                             job_id,
                             scene_number,
                         )
                     else:
-                        logger.info("job=%s image-to-video started scene=%s", job_id, scene_number)
-                        audio_duration = audio_by_scene[scene_number][0].duration_seconds
-                        clip = await self._video_clip_generator.animate(
-                            plan,
-                            images[scene_number],
-                            prepared.work_dir / "clips",
-                            duration_seconds=audio_duration,
+                        cached_clip = (
+                            prepared.work_dir / "clips" / f"scene-{scene_number:03d}.mp4"
                         )
-                        logger.info(
-                            "job=%s image-to-video completed scene=%s "
-                            "target_duration_seconds=%.2f path=%s bytes=%s",
-                            job_id,
-                            scene_number,
-                            audio_duration,
-                            clip.path,
-                            clip.path.stat().st_size,
+                        source_image = images[scene_number].path
+                        cache_is_current = (
+                            cached_clip.is_file()
+                            and cached_clip.stat().st_size > 0
+                            and cached_clip.stat().st_mtime >= source_image.stat().st_mtime
                         )
+                        if cache_is_current:
+                            clip = VisualArtifact(
+                                scene_number=scene_number,
+                                path=cached_clip,
+                                kind="video",
+                                revision=images[scene_number].revision,
+                            )
+                            logger.info(
+                                "job=%s image-to-video reused scene=%s path=%s bytes=%s",
+                                job_id,
+                                scene_number,
+                                cached_clip,
+                                cached_clip.stat().st_size,
+                            )
+                        else:
+                            logger.info(
+                                "job=%s image-to-video started scene=%s",
+                                job_id,
+                                scene_number,
+                            )
+                            audio_duration = audio_by_scene[scene_number][0].duration_seconds
+                            clip = await self._video_clip_generator.animate(
+                                plan,
+                                images[scene_number],
+                                prepared.work_dir / "clips",
+                                duration_seconds=audio_duration,
+                            )
+                            logger.info(
+                                "job=%s image-to-video completed scene=%s "
+                                "target_duration_seconds=%.2f path=%s bytes=%s",
+                                job_id,
+                                scene_number,
+                                audio_duration,
+                                clip.path,
+                                clip.path.stat().st_size,
+                            )
                     completed_clips += 1
                     await self._reporter.update(
                         job_id,
                         JobStatus.GENERATING_VIDEO,
                         f"completed={completed_clips} total={total_scenes}"
                         + (
-                            f" | slide fixo da cena {scene_number} preservado"
+                            f" | imagem estática da cena {scene_number} preparada"
                             if plan.media_mode == MediaMode.STATIC
                             else f" | vídeo da cena {scene_number} concluído"
                         ),
@@ -408,6 +558,8 @@ class CreatePresentationVideo:
                         ),
                         presenter_video=presenter,
                         visual=clips_by_scene[scene_number],
+                        visual_image=images[scene_number],
+                        visual_plan=plans[scene_number],
                     )
                     logger.info(
                         "job=%s scene rendering completed scene=%s duration_seconds=%.2f path=%s",
@@ -480,3 +632,15 @@ class CreatePresentationVideo:
         """CLI convenience: prepare and immediately approve all first-generation images."""
         prepared = await self.prepare(request, job_id)
         return await self.finalize(prepared)
+
+
+def _valid_wav_duration(path: Path) -> float | None:
+    if not path.is_file() or path.stat().st_size <= 44:
+        return None
+    try:
+        with wave.open(str(path), "rb") as audio:
+            frame_rate = audio.getframerate()
+            duration = audio.getnframes() / frame_rate if frame_rate else 0
+    except (OSError, EOFError, wave.Error):
+        return None
+    return duration if duration > 0 else None

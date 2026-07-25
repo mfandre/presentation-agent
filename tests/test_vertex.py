@@ -171,8 +171,28 @@ async def test_image_generator_rejects_static_scene(tmp_path: Path) -> None:
         retry_backoff_seconds=0,
     )
 
-    with pytest.raises(ValueError, match="Static scenes"):
+    with pytest.raises(ValueError, match="Preserved static scenes"):
         await generator.generate(_video_plan(MediaMode.STATIC), [], tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_image_generator_creates_editorial_image_for_text_only_static_scene(
+    tmp_path: Path,
+) -> None:
+    generated_png = b"\x89PNG\r\neditorial-image"
+    models = FakeContentModels(_inline_response(generated_png, "image/png"))
+    generator = VertexImageAssetGenerator(
+        SimpleNamespace(models=models),
+        max_retries=0,
+        retry_backoff_seconds=0,
+    )
+    plan = _video_plan(MediaMode.STATIC).model_copy(
+        update={"preserve_source_frame": False, "source_slide_number": None}
+    )
+
+    artifact = await generator.generate(plan, [], tmp_path)
+
+    assert artifact.path.read_bytes() == generated_png
 
 
 @pytest.mark.asyncio

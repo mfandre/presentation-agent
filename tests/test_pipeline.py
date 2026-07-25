@@ -1,8 +1,9 @@
+import wave
 from pathlib import Path
 
 import pytest
 
-from presentation_video.application.pipeline import CreatePresentationVideo
+from presentation_video.application.pipeline import CreatePresentationVideo, _valid_wav_duration
 from presentation_video.domain.models import (
     AudioArtifact,
     JobStatus,
@@ -125,6 +126,8 @@ class FakeSceneRenderer:
         output_path: Path,
         presenter_video: Path | None = None,
         visual: VisualArtifact | None = None,
+        visual_image: VisualArtifact | None = None,
+        visual_plan: VisualScenePlan | None = None,
     ) -> SceneArtifact:
         self.calls.append((scene_number, source_slide.number, visual.kind if visual else None))
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,3 +234,25 @@ async def test_pipeline_processes_narrative_scenes_not_every_source_page(tmp_pat
     assert len(prepared.visual_images) == 2
     assert prepared.visual_images[1].path == document.slides[4].image_path
     assert result.duration_seconds == 20
+
+    prepared.visual_images[0].path.unlink()
+    restored = await pipeline.restore(request, job_id="test-job")
+
+    assert images.calls == [(1, [1, 2, 3]), (1, [1, 2, 3])]
+    assert [image.scene_number for image in restored.visual_images] == [1, 2]
+
+
+def test_valid_wav_duration_accepts_checkpoint_and_rejects_partial_file(
+    tmp_path: Path,
+) -> None:
+    valid = tmp_path / "valid.wav"
+    with wave.open(str(valid), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"\0\0" * 16_000)
+    partial = tmp_path / "partial.wav"
+    partial.write_bytes(b"unfinished")
+
+    assert _valid_wav_duration(valid) == pytest.approx(1)
+    assert _valid_wav_duration(partial) is None

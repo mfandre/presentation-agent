@@ -13,6 +13,7 @@ interface UseVideoCreationResult {
   createVideo(input: CreateVideoInput): Promise<void>;
   regenerateScene(sceneNumber: number, prompt: string): Promise<void>;
   approveVisuals(): Promise<void>;
+  resumeVideo(jobId?: string): Promise<void>;
   reset(): void;
   assetUrl(path: string): string;
 }
@@ -166,6 +167,20 @@ export function useVideoCreation(
     }
   }, [gateway, job]);
 
+  const resumeVideo = useCallback(async (jobId?: string) => {
+    const targetJobId = (jobId ?? job?.job_id ?? "").trim().toLowerCase();
+    if (!targetJobId) return;
+    setIsActing(true);
+    setError(null);
+    try {
+      setJob(await gateway.resumeVideo(targetJobId));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Não foi possível retomar o vídeo.");
+    } finally {
+      setIsActing(false);
+    }
+  }, [gateway, job]);
+
   const reset = useCallback(() => {
     window.localStorage.removeItem(STORED_JOB_KEY);
     setJob(null);
@@ -184,6 +199,7 @@ export function useVideoCreation(
     createVideo,
     regenerateScene,
     approveVisuals,
+    resumeVideo,
     reset,
     assetUrl: (path: string) => gateway.assetUrl(path),
   };

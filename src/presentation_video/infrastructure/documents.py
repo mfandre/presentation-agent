@@ -35,16 +35,40 @@ class PdfIngestor(DocumentIngestor):
         images = _render_pdf(source, work_dir / "slides")
         document = pymupdf.open(source)
         try:
+            page_features: list[tuple[str, int, int]] = []
+            for page_index in range(document.page_count):
+                page = document.load_page(page_index)
+                text = page.get_text("text").strip()
+                page_features.append(
+                    (text, len(page.get_images(full=True)), len(page.get_drawings()))
+                )
+            text_heavy_pages = sum(
+                len(text.split()) >= 120 and drawing_count < 3
+                for text, _, drawing_count in page_features
+            )
+            document_is_long_form_text = (
+                bool(page_features)
+                and text_heavy_pages / len(page_features) >= 0.65
+            )
             slides: list[SlideContent] = []
             for index in range(1, document.page_count + 1):
-                page = document.load_page(index - 1)
-                text = page.get_text("text").strip()
+                text, embedded_images, vector_drawings = page_features[index - 1]
+                word_count = len(text.split())
+                source_frame_suitable = not (
+                    document_is_long_form_text
+                    or (
+                        word_count >= 120
+                        and vector_drawings < 3
+                        and embedded_images <= 1
+                    )
+                )
                 slides.append(
                     SlideContent(
                         number=index,
                         title=_first_non_empty_line(text),
                         body_text=text,
                         image_path=images[index - 1],
+                        source_frame_suitable=source_frame_suitable,
                     )
                 )
         finally:
@@ -114,6 +138,7 @@ class PptxIngestor(DocumentIngestor):
                     body_text="\n".join(text_parts),
                     speaker_notes=notes,
                     image_path=images[index - 1],
+                    source_frame_suitable=True,
                 )
             )
 

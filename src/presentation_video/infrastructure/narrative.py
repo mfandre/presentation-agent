@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic_ai import Agent, UnexpectedModelBehavior
 
 from presentation_video.domain.errors import NarrativeDurationError, NarrativeGenerationError
 from presentation_video.domain.models import (
+    CreativeDirection,
     MediaMode,
     PresentationDocument,
     PresentationScript,
@@ -19,6 +21,7 @@ from presentation_video.infrastructure.replicate import ReplicatePredictionClien
 
 logger = logging.getLogger(__name__)
 
+_FINAL_WORD_BUDGET_TOLERANCE = 0.05
 
 _SYSTEM_PROMPT = """
 You are a senior presentation writer and speaker coach.
@@ -50,6 +53,23 @@ Rules:
   two video scenes in a row, and use static scenes as clear informational anchors.
 - Give every scene a story_beat and a transition_to_next. Narration should hand off naturally from
   one scene to the next without announcing slide or scene numbers.
+- Define one global creative_direction before the scenes. Its hook_question opens a curiosity gap,
+  its throughline is a source-grounded idea or artifact that can recur across the complete video,
+  and its visual_motif, palette, accent_color, pacing, and reveal_scene_number give the edit a
+  coherent identity. Do not invent a physical metaphor unsupported by the presentation.
+- Derive palette and accent_color from the source's actual brand cues, subject, emotional arc, and
+  setting. If the source is visually neutral or text-only, choose a contextually meaningful
+  editorial palette. Do not default mechanically to blue, navy, gray, or generic corporate colors.
+- First discover the presentation's own narrative logic. Populate central_thesis,
+  narrative_device, and recurring_visual_principle. Populate transformation_from and
+  transformation_to only when the source genuinely describes a transformation. Add concise
+  concept_mappings when the source explicitly compares, analogizes, or translates one domain into
+  another. Do not force a historical arc, journey, transformation, or analogy onto every source.
+- For every scene, state scene_purpose, relationship_to_thesis, and narrative_progress. These
+  fields must explain why the scene exists, how it advances this presentation's particular logic,
+  and what new understanding it contributes. Do not use generic labels such as "development".
+- The opening should establish the hook. Withhold its strongest resolution until the selected
+  reveal scene or conclusion, while keeping every claim faithful to the source.
 - Do not return scene durations. Timing is calculated deterministically by the application.
 """.strip()
 
@@ -67,12 +87,16 @@ class _LLMSceneScript(BaseModel):
     story_beat: str = Field(min_length=1, max_length=120)
     visual_intent: str = Field(min_length=1, max_length=500)
     transition_to_next: str = Field(min_length=1, max_length=300)
+    scene_purpose: str = Field(default="", max_length=300)
+    relationship_to_thesis: str = Field(default="", max_length=400)
+    narrative_progress: str = Field(default="", max_length=300)
 
 
 class _LLMPresentationScript(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     title: str
+    creative_direction: CreativeDirection = Field(default_factory=CreativeDirection)
     scenes: list[_LLMSceneScript] = Field(min_length=1)
     omitted_source_slide_numbers: list[int] = Field(default_factory=list)
 
@@ -96,6 +120,7 @@ def _narrative_payload(
                 "title": slide.title,
                 "body_text": slide.body_text,
                 "speaker_notes": slide.speaker_notes,
+                "source_frame_suitable": slide.source_frame_suitable,
             }
             for slide in document.slides
         ],
@@ -161,11 +186,13 @@ def _script_issues(
             f"{target_seconds} seconds"
         )
     maximum_words = math.floor(target_seconds * words_per_minute / 60)
+    tolerated_words = math.floor(maximum_words * (1 + _FINAL_WORD_BUDGET_TOLERANCE))
     actual_words = sum(len(scene.narration.split()) for scene in script.scenes)
-    if actual_words > maximum_words:
+    if actual_words > tolerated_words:
         issues.append(
             f"narration has {actual_words} words; the maximum budget is {maximum_words} words "
-            f"at {words_per_minute} words per minute"
+            f"at {words_per_minute} words per minute, with a final validation tolerance of "
+            f"{round(_FINAL_WORD_BUDGET_TOLERANCE * 100)}%"
         )
     return issues
 
@@ -197,6 +224,38 @@ def _allocate_weighted_total(
     return allocations
 
 
+def _compact_narration_to_budget(
+    script: _LLMPresentationScript,
+    maximum_words: int,
+) -> _LLMPresentationScript:
+    compacted = script.model_copy(deep=True)
+    weights = [len(scene.narration.split()) for scene in compacted.scenes]
+    minimum = min(20, max(maximum_words // max(len(compacted.scenes), 1) // 2, 1))
+    budgets = _allocate_weighted_total(maximum_words, weights, minimum_per_item=minimum)
+    for scene, budget in zip(compacted.scenes, budgets, strict=True):
+        words = scene.narration.split()
+        if len(words) <= budget:
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", scene.narration.strip())
+        selected: list[str] = []
+        selected_words = 0
+        for sentence in sentences:
+            sentence_words = sentence.split()
+            if selected_words + len(sentence_words) > budget:
+                break
+            selected.append(sentence)
+            selected_words += len(sentence_words)
+        if selected:
+            scene.narration = " ".join(selected)
+            continue
+        scene.narration = " ".join(words[:budget]).rstrip(".,;:") + "."
+    return compacted
+
+
+def _only_word_budget_issue(issues: list[str]) -> bool:
+    return bool(issues) and all(issue.startswith("narration has") for issue in issues)
+
+
 def _duration_too_short_error(target_seconds: int, scene_count: int) -> NarrativeDurationError:
     return NarrativeDurationError(
         f"requested duration of {target_seconds}s cannot allocate at least one second "
@@ -215,8 +274,16 @@ def _build_script(generated: _LLMPresentationScript, target_seconds: int) -> Pre
     _ensure_duration_can_cover_scenes(target_seconds, len(generated.scenes))
     weights = [max(len(scene.narration.split()), 1) for scene in generated.scenes]
     durations = _allocate_weighted_total(target_seconds, weights, minimum_per_item=1)
+    direction = generated.creative_direction.model_copy(deep=True)
+    if not direction.central_thesis:
+        direction.central_thesis = direction.throughline
+    if not direction.narrative_device:
+        direction.narrative_device = direction.visual_motif
+    if not direction.recurring_visual_principle:
+        direction.recurring_visual_principle = direction.throughline
     return PresentationScript(
         title=generated.title,
+        creative_direction=direction,
         scenes=[
             SceneScript(
                 scene_number=scene.scene_number,
@@ -228,6 +295,11 @@ def _build_script(generated: _LLMPresentationScript, target_seconds: int) -> Pre
                 story_beat=scene.story_beat,
                 visual_intent=scene.visual_intent,
                 transition_to_next=scene.transition_to_next,
+                scene_purpose=scene.scene_purpose or scene.visual_intent,
+                relationship_to_thesis=(
+                    scene.relationship_to_thesis or direction.central_thesis
+                ),
+                narrative_progress=scene.narrative_progress or scene.story_beat,
             )
             for scene, duration in zip(generated.scenes, durations, strict=True)
         ],
@@ -265,13 +337,19 @@ def _initial_prompt(payload: dict[str, object], target_seconds: int, words_per_m
         "Create an opening, a logical development, and a conclusion. Merge pages that support "
         "the same idea, skip repeated agendas/appendices, and preserve all facts needed for the "
         "story to remain faithful to the source.\n"
+        "Before the scenes, define creative_direction with one hook_question, a source-grounded "
+        "throughline, central_thesis, narrative_device, recurring_visual_principle, visual_motif, "
+        "restrained palette, one accent_color, pacing, and a reveal_scene_number. Add a "
+        "transformation_from/to and concept_mappings only when supported by the source. Carry that "
+        "direction through the complete narrative.\n"
         "For each scene, return consecutive scene_number and the source_slide_numbers used to "
         "ground that scene. A source page may support more than one scene when necessary.\n"
         "Build a fluid hybrid storyboard. Use static scenes as readable information anchors and "
         "video scenes as short word-free moments of movement, context, or demonstration. Create "
         "at least two scenes and include both media modes. Do not alternate mechanically; let the "
         "story determine the rhythm, but never place more than two video scenes consecutively.\n"
-        "For every scene provide story_beat, visual_intent, and transition_to_next. Make each "
+        "For every scene provide story_beat, visual_intent, transition_to_next, scene_purpose, "
+        "relationship_to_thesis, and narrative_progress. Make each "
         "narration flow into the following beat without saying 'slide', 'page', or 'scene'.\n"
         "Keep static information anchors concise so the edit does not remain on one fixed frame "
         "for too long. Let longer explanatory passages breathe through word-free video beats.\n"
@@ -294,6 +372,15 @@ def _revision_prompt(
     target_words = math.floor(maximum_words * 0.9)
     actual_words = sum(len(scene.narration.split()) for scene in script.scenes)
     words_to_remove = max(actual_words - target_words, 0)
+    scene_word_budgets = _allocate_weighted_total(
+        target_words,
+        [len(scene.narration.split()) for scene in script.scenes],
+        minimum_per_item=min(20, max(target_words // max(len(script.scenes), 1) // 2, 1)),
+    )
+    per_scene_budget = ", ".join(
+        f"scene {scene.scene_number}: at most {budget} words"
+        for scene, budget in zip(script.scenes, scene_word_budgets, strict=True)
+    )
     minimum_scenes, recommended_scenes, maximum_scenes = _scene_count_guidance(target_seconds)
     return (
         "Revise the previous script instead of starting a different presentation.\n"
@@ -305,6 +392,7 @@ def _revision_prompt(
         f"- Return exactly {target_words} words in total; remove at least {words_to_remove} words "
         "from "
         f"the previous version, which has {actual_words} words.\n"
+        f"- Per-scene narration budgets: {per_scene_budget}.\n"
         f"- Aim for about {recommended_scenes} scenes, normally between {minimum_scenes} and "
         f"{maximum_scenes}; do not mirror the source page count.\n"
         "- Renumber scenes consecutively from 1 and cite only existing source_slide_numbers.\n"
@@ -314,6 +402,11 @@ def _revision_prompt(
         "- Never place more than two video scenes consecutively. Static scenes carry exact readable "
         "information; video scene visual_intent must contain no visible words or screens.\n"
         "- Return story_beat, visual_intent, and transition_to_next for every scene.\n"
+        "- Return scene_purpose, relationship_to_thesis, and narrative_progress for every scene.\n"
+        "- Preserve or correct one coherent creative_direction, including central_thesis, "
+        "narrative_device, recurring_visual_principle, and any source-grounded concept mappings. "
+        "Delay its strongest answer "
+        "until reveal_scene_number or the conclusion.\n"
         "- Account for every source page either in a scene or in omitted_source_slide_numbers.\n"
         "- Count the words in each rewritten scene narration before returning the JSON.\n"
         "- Condense wording and remove repetition; do not remove essential facts.\n"
@@ -457,11 +550,47 @@ class DebugNarrativeGenerator(NarrativeGenerator):
                         if is_last
                         else "Connect the final idea directly to the next narrative beat"
                     ),
+                    scene_purpose=(
+                        "Establish the source topic"
+                        if index == 0
+                        else "Resolve the source argument" if is_last else "Develop the source evidence"
+                    ),
+                    relationship_to_thesis=(
+                        "Connect this source section to the presentation's central evidence"
+                    ),
+                    narrative_progress=(
+                        "Open the argument"
+                        if index == 0
+                        else "Conclude the argument" if is_last else "Add supporting evidence"
+                    ),
                 )
             )
 
+        hook = (
+            f"Como {document.title or 'esta apresentação'} conecta evidência à decisão?"
+            if language.lower().startswith("pt")
+            else f"How does {document.title or 'this presentation'} connect evidence to action?"
+        )
         script = _build_script(
-            _LLMPresentationScript(title=document.title, scenes=scenes), target_seconds
+            _LLMPresentationScript(
+                title=document.title,
+                creative_direction=CreativeDirection(
+                    hook_question=hook,
+                    throughline="A evidência principal avança de contexto para decisão",
+                    visual_motif="editorial documentary grounded in the original presentation",
+                    palette=["warm ivory", "charcoal", "terracotta"],
+                    accent_color="saffron",
+                    pacing="measured",
+                    reveal_scene_number=scene_count,
+                    central_thesis="A evidência principal deve conduzir a uma decisão",
+                    narrative_device="Progressão do contexto para a decisão",
+                    recurring_visual_principle=(
+                        "Cada cena acrescenta uma evidência concreta até a decisão final"
+                    ),
+                ),
+                scenes=scenes,
+            ),
+            target_seconds,
         )
         logger.warning(
             "DEBUG_MODE active: deterministic narrative created without external calls "
@@ -530,6 +659,16 @@ class PydanticAINarrativeGenerator(NarrativeGenerator):
                 )
                 return final_script
             if revision == self._max_revisions:
+                if _only_word_budget_issue(issues):
+                    compacted = _compact_narration_to_budget(script, maximum_words)
+                    logger.warning(
+                        "narrative deterministically compacted provider=pydantic_ai "
+                        "from_words=%s to_words=%s maximum_words=%s",
+                        sum(len(scene.narration.split()) for scene in script.scenes),
+                        sum(len(scene.narration.split()) for scene in compacted.scenes),
+                        maximum_words,
+                    )
+                    return _build_script(compacted, target_seconds)
                 raise _final_validation_error(issues, revision + 1)
             logger.warning(
                 "narrative revision requested provider=pydantic_ai attempt=%s issues=%s",
@@ -626,6 +765,16 @@ class ReplicateNarrativeGenerator(NarrativeGenerator):
                 )
                 return final_script
             if revision == self._max_revisions:
+                if _only_word_budget_issue(issues):
+                    compacted = _compact_narration_to_budget(script, maximum_words)
+                    logger.warning(
+                        "narrative deterministically compacted provider=replicate "
+                        "from_words=%s to_words=%s maximum_words=%s",
+                        sum(len(scene.narration.split()) for scene in script.scenes),
+                        sum(len(scene.narration.split()) for scene in compacted.scenes),
+                        maximum_words,
+                    )
+                    return _build_script(compacted, target_seconds)
                 raise _final_validation_error(issues, revision + 1)
             logger.warning(
                 "narrative revision requested provider=replicate attempt=%s issues=%s",

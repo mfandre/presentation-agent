@@ -1,16 +1,32 @@
 from __future__ import annotations
 
 import base64
+import logging
 import mimetypes
 from pathlib import Path
 
 from presentation_video.domain.models import MediaMode, SlideContent, VisualArtifact, VisualScenePlan
 from presentation_video.infrastructure.process import run_process
 from presentation_video.infrastructure.replicate import ReplicatePredictionClient
+from presentation_video.infrastructure.concept_grounding import (
+    default_concept_visualization,
+    infer_required_concepts,
+)
+
+logger = logging.getLogger(__name__)
+
+_SAFE_VISUAL_POLICY = (
+    "Safety and fidelity constraints: depict routine, calm, lawful professional activity only. "
+    "Use anonymous adults with faces de-emphasized and correct PPE when the source supports an "
+    "industrial setting. No public figures, recognizable real people, politics, protests, crowds, "
+    "conflict, weapons, military content, fire, smoke, explosions, injuries, emergencies, dangerous "
+    "acts, medical procedures, minors, nudity, sexual content, drugs, or hateful symbols. "
+)
 
 
 def _visual_prompt(plan: VisualScenePlan, source_slides: list[SlideContent] | None = None) -> str:
     source_context = ""
+    grounded_text = ""
     if source_slides:
         grounded_pages = " ".join(
             f"Page {slide.number} — {slide.title}: {slide.body_text} {slide.speaker_notes}"
@@ -22,20 +38,58 @@ def _visual_prompt(plan: VisualScenePlan, source_slides: list[SlideContent] | No
             f"Facts and concepts from those pages that must ground the visual: "
             f"{grounded_text or 'none'}."
         )
+    concepts = plan.must_show_concepts or infer_required_concepts(
+        f"{plan.prompt} {plan.focal_action} {grounded_text}"
+    )
+    concept_visualization = plan.concept_visualization or default_concept_visualization(concepts)
+    concept_contract = ""
+    if concepts:
+        concept_contract = (
+            f" Required concepts that must be visually unmistakable: {', '.join(concepts)}. "
+            f"Rendering contract: {concept_visualization}. Do not substitute these concepts with "
+            "generic teamwork, a person inspecting equipment, or decorative technology imagery. "
+        )
+    narrative_contract = (
+        f"Scene purpose: {plan.scene_purpose}. "
+        f"Relationship to the presentation thesis: {plan.relationship_to_thesis}. "
+        f"Narrative progress: {plan.narrative_progress}. "
+    )
+    if plan.visible_evidence:
+        narrative_contract += (
+            f"Concrete visible evidence required: {'; '.join(plan.visible_evidence)}. "
+        )
+    if plan.forbidden_substitutions:
+        narrative_contract += (
+            f"Do not substitute with: {'; '.join(plan.forbidden_substitutions)}. "
+        )
     return (
         "Create a grounded, plausible real-world image that can become a short moving shot. "
+        "This is one precise documentary beat, not a montage or a summary of the narration. "
+        "Use exactly one location, one primary source-grounded subject, and one observable action. "
+        "Do not combine multiple moments, departments, environments, or time periods. "
         "Show concrete physical action, environment, equipment, materials, or human behavior "
         "directly supported by the source. The image must communicate through subjects, action, "
         "composition, color, and lighting alone. "
         f"Every visible element must help teach a source concept. Scene request: {plan.prompt}. "
+        f"{concept_contract}{narrative_contract}"
+        f"Editorial focal action: {plan.focal_action}. Entrance: {plan.entrance_motion}. "
+        f"Exit continuity: {plan.transition_out}. "
         f"Style: {plan.visual_style}.{source_context} "
+        "Treat the cited source as a strict whitelist: do not invent a plant, laboratory, control "
+        "room, machine, geological sample, uniform, executive, device, or workflow unless that "
+        "specific element is supported by the cited pages or scene request. "
+        "Prefer a close, evidence-rich view of the actual artifact, material, hands, or routine "
+        "task over a generic team, meeting, leadership pose, or symbolic decision gesture. "
+        f"{_SAFE_VISUAL_POLICY}"
         "Do not translate abstract concepts into decorative physical metaphors. "
         "Never create an isometric view, 3D diorama, miniature, clay render, toy model, model city, "
-        "symbolic factory, bridge, conveyor belt, floating icon grid, or glossy infographic unless "
+        "symbolic factory, bridge, conveyor belt, generic floating icon grid, or glossy infographic unless "
         "that physical object is literally present in the source. Avoid generic corporate scenes. "
         "Hard text-free constraint: show no words, letters, numbers, typography, captions, logos, "
-        "signage, documents, presentation pages, monitors, screens, UI, dashboards, terminals, "
-        "charts, tables, gauges with numbers, or any other readable element. "
+        "signage, documents, presentation pages, fake interface copy, gauges with numbers, or any "
+        "other readable element. A clean non-readable software workflow is allowed only to express "
+        "the required AI, agent, orchestration, data-flow, or governance concepts. Never depict AI "
+        "as a robot, humanoid, glowing brain, hologram, magic orb, or generic neon network. "
         f"Also exclude: {plan.negative_prompt}."
     )
 
@@ -77,8 +131,8 @@ class ReplicateImageAssetGenerator:
         output_dir: Path,
         revision: int = 1,
     ) -> VisualArtifact:
-        if plan.media_mode != MediaMode.VIDEO:
-            raise ValueError("Static scenes must use an unchanged source page")
+        if plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
+            raise ValueError("Preserved static scenes must use an unchanged source page")
         output = await self._client.run(
             self._model,
             {**self._input_defaults, "prompt": _visual_prompt(plan, source_slides)},
@@ -112,7 +166,7 @@ class ReplicateVideoAssetGenerator:
         self._client = client
         self._model = model
         self._image_input_key = image_input_key
-        self._input_defaults = input_defaults or {}
+        self._input_defaults = _sanitize_video_inputs(model, input_defaults or {})
 
     async def animate(
         self,
@@ -158,14 +212,35 @@ class ReplicateVideoAssetGenerator:
         inputs = {
             **self._input_defaults,
             "prompt": (
-                f"{plan.camera_motion}. Create a short motion clip at a natural, normal speed. "
+                f"{plan.camera_motion}. Animate the approved input image faithfully at a natural, "
+                "normal speed. Preserve the same location, subjects, clothing, equipment, layout, "
+                "lighting, palette, and action visible in the input image. Do not introduce any new "
+                "person, face, object, machine, room, landscape, sign, event, or storyline. "
+                "Use one continuous restrained camera move and one subtle source-grounded action. "
                 "Do not slow the action to fill the narration duration; the application will "
-                "repeat the clip at its original frame rate until the scene audio ends. "
+                "use the clip once inside a longer visual timeline. "
+                f"{_SAFE_VISUAL_POLICY}"
                 f"{_visual_prompt(plan)}"
             ),
             self._image_input_key: data_url,
         }
-        output = await self._client.run(self._model, inputs)
+        try:
+            output = await self._client.run(self._model, inputs)
+        except RuntimeError as exc:
+            if not _is_sensitive_generation_error(exc):
+                raise
+            logger.warning(
+                "replicate video blocked by content safety; using local motion fallback "
+                "model=%s scene=%s",
+                self._model,
+                image.scene_number,
+            )
+            return await FfmpegImageAnimator().animate(
+                plan,
+                image,
+                output_dir,
+                duration_seconds,
+            )
         url = self._client.output_url(output)
         suffix = Path(url.split("?", 1)[0]).suffix.lower()
         if suffix not in {".mp4", ".webm", ".mov"}:
@@ -180,6 +255,42 @@ class ReplicateVideoAssetGenerator:
             kind="video",
             revision=image.revision,
         )
+
+
+def _sanitize_video_inputs(
+    model: str,
+    inputs: dict[str, object],
+) -> dict[str, object]:
+    model_name = model.partition(":")[0]
+    if model_name != "google/veo-3.1-lite":
+        return dict(inputs)
+    supported = {
+        "prompt",
+        "image",
+        "last_frame",
+        "aspect_ratio",
+        "duration",
+        "resolution",
+        "seed",
+    }
+    removed = sorted(set(inputs) - supported)
+    if removed:
+        logger.warning(
+            "replicate video inputs removed unsupported fields model=%s fields=%s",
+            model_name,
+            removed,
+        )
+    return {key: value for key, value in inputs.items() if key in supported}
+
+
+def _is_sensitive_generation_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "flagged as sensitive" in message
+        or "content safety" in message
+        or "nsfw" in message
+        or "(e005)" in message
+    )
 
 
 class FfmpegImageAnimator:
@@ -197,6 +308,8 @@ class FfmpegImageAnimator:
         output_dir.mkdir(parents=True, exist_ok=True)
         destination = output_dir / f"scene-{image.scene_number:03d}.mp4"
         cycle_duration = min(max(duration_seconds, 5.0), 8.0)
+        frame_count = max(round(cycle_duration * 30), 1)
+        motion_filter = _local_motion_filter(plan.motion_preset.value, frame_count)
         await run_process(
             "ffmpeg",
             "-y",
@@ -205,8 +318,8 @@ class FfmpegImageAnimator:
             "-i",
             str(image.path),
             "-vf",
-            "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,"
-            "zoompan=z='min(zoom+0.0008,1.08)':d=1:s=1920x1080:fps=30,format=yuv420p",
+            f"scale=2048:1152:force_original_aspect_ratio=increase,crop=2048:1152,"
+            f"{motion_filter}:d=1:s=1920x1080:fps=30,format=yuv420p",
             "-t",
             f"{cycle_duration:.3f}",
             "-an",
@@ -222,3 +335,36 @@ class FfmpegImageAnimator:
             kind="video",
             revision=image.revision,
         )
+
+
+def _local_motion_filter(preset: str, frame_count: int) -> str:
+    progress = f"on/{max(frame_count - 1, 1)}"
+    filters = {
+        "pull_back": (
+            "zoompan=z='max(1.0,1.08-0.08*"
+            + progress
+            + ")':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        ),
+        "pan_left": (
+            "zoompan=z='1.06':x='(iw-iw/zoom)*(1-"
+            + progress
+            + ")':y='ih/2-(ih/zoom/2)'"
+        ),
+        "pan_right": (
+            "zoompan=z='1.06':x='(iw-iw/zoom)*"
+            + progress
+            + "':y='ih/2-(ih/zoom/2)'"
+        ),
+        "drift_up": (
+            "zoompan=z='1.05':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-"
+            + progress
+            + ")'"
+        ),
+        "none": "zoompan=z='1.0':x='0':y='0'",
+    }
+    return filters.get(
+        preset,
+        "zoompan=z='min(1.08,1.0+0.08*"
+        + progress
+        + ")':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+    )

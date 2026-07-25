@@ -17,7 +17,14 @@ from pydantic import BaseModel, Field
 
 from presentation_video.bootstrap import build_pipeline
 from presentation_video.domain.errors import UserFacingError
-from presentation_video.domain.models import JobStatus, MediaMode, PreparedVideoJob, VideoJobRequest
+from presentation_video.domain.models import (
+    CreativeDirection,
+    JobStatus,
+    MediaMode,
+    PreparedVideoJob,
+    VideoJobRequest,
+    VisualBeat,
+)
 from presentation_video.infrastructure.reporting import (
     CallbackJobReporter,
     CompositeJobReporter,
@@ -44,10 +51,24 @@ class SceneImageView(BaseModel):
     image_url: str
     prompt: str
     camera_motion: str
+    motion_preset: str
+    entrance_motion: str
+    focal_action: str
+    transition_out: str
+    transition_preset: str
+    visual_beats: list[VisualBeat] = Field(default_factory=list)
     revision: int
     media_mode: MediaMode
     story_beat: str
+    must_show_concepts: list[str] = Field(default_factory=list)
+    concept_visualization: str = ""
+    scene_purpose: str = ""
+    relationship_to_thesis: str = ""
+    narrative_progress: str = ""
+    visible_evidence: list[str] = Field(default_factory=list)
+    forbidden_substitutions: list[str] = Field(default_factory=list)
     source_slide_number: int | None = None
+    preserve_source_frame: bool = True
 
 
 class RegenerateSceneRequest(BaseModel):
@@ -78,6 +99,7 @@ class JobView(BaseModel):
     scene_images: list[SceneImageView] = Field(default_factory=list)
     regenerating_scene_numbers: list[int] = Field(default_factory=list)
     debug_mode: bool = False
+    creative_direction: CreativeDirection | None = None
 
 
 @dataclass(slots=True)
@@ -90,9 +112,11 @@ class JobRecord:
     prepared: PreparedVideoJob | None = None
     regenerating_scenes: set[int] = field(default_factory=set)
     finalization_started: bool = False
+    active_task: asyncio.Task[None] | None = None
 
 
 _jobs: dict[str, JobRecord] = {}
+_resuming_jobs: set[str] = set()
 _jobs_lock = asyncio.Lock()
 _upload_root = settings.work_root / "uploads"
 _upload_root.mkdir(parents=True, exist_ok=True)
@@ -141,6 +165,16 @@ def _recover_completed_job(job_id: str) -> JobRecord | None:
     target_seconds = min(max(int(manifest.get("target_seconds") or round(duration)), 30), 1800)
     script_path = output_dir / "script.json"
     visual_plan_path = output_dir / "visual-plan.json"
+    creative_direction = None
+    if script_path.is_file():
+        try:
+            creative_direction = CreativeDirection.model_validate(
+                json.loads(script_path.read_text(encoding="utf-8")).get(
+                    "creative_direction", {}
+                )
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            logger.warning("job=%s creative direction recovery failed", job_id)
     view = JobView(
         job_id=job_id,
         status=JobStatus.COMPLETED,
@@ -160,6 +194,7 @@ def _recover_completed_job(job_id: str) -> JobRecord | None:
         visual_plan_url=(
             f"/v1/videos/{job_id}/visual-plan" if visual_plan_path.is_file() else None
         ),
+        creative_direction=creative_direction,
     )
     logger.info(
         "job=%s recovered completed artifact duration_seconds=%.2f path=%s",
@@ -174,6 +209,47 @@ def _recover_completed_job(job_id: str) -> JobRecord | None:
         script_path=script_path if script_path.is_file() else None,
         visual_plan_path=visual_plan_path if visual_plan_path.is_file() else None,
         finalization_started=True,
+    )
+
+
+def _find_uploaded_source(job_id: str) -> Path | None:
+    if not _JOB_ID_PATTERN.fullmatch(job_id):
+        return None
+    return next(
+        (
+            path
+            for suffix in (".pdf", ".pptx")
+            if (path := _upload_root / f"{job_id}{suffix}").is_file()
+        ),
+        None,
+    )
+
+
+def _request_metadata_path(job_id: str) -> Path:
+    return settings.output_root / job_id / "request.json"
+
+
+def _finalization_has_started(job_id: str) -> bool:
+    work_dir = settings.work_root / job_id
+    return any(
+        path.is_file()
+        for directory in ("audio", "avatars", "clips", "scenes")
+        for path in (work_dir / directory).glob("*")
+    )
+
+
+def _load_resume_request(job_id: str, source_path: Path) -> VideoJobRequest:
+    metadata_path = _request_metadata_path(job_id)
+    if metadata_path.is_file():
+        return VideoJobRequest.model_validate_json(metadata_path.read_text(encoding="utf-8"))
+    script_path = settings.output_root / job_id / "script.json"
+    script = json.loads(script_path.read_text(encoding="utf-8"))
+    target_seconds = sum(
+        int(scene.get("target_seconds") or 0) for scene in script.get("scenes", [])
+    )
+    return VideoJobRequest(
+        source_path=source_path,
+        target_seconds=min(max(target_seconds, 30), 1800),
     )
 
 
@@ -243,10 +319,24 @@ def _scene_image_views(prepared: PreparedVideoJob) -> list[SceneImageView]:
             ),
             prompt=plans[image.scene_number].prompt,
             camera_motion=plans[image.scene_number].camera_motion,
+            motion_preset=plans[image.scene_number].motion_preset.value,
+            entrance_motion=plans[image.scene_number].entrance_motion,
+            focal_action=plans[image.scene_number].focal_action,
+            transition_out=plans[image.scene_number].transition_out,
+            transition_preset=plans[image.scene_number].transition_preset.value,
+            visual_beats=plans[image.scene_number].visual_beats,
             revision=image.revision,
             media_mode=plans[image.scene_number].media_mode,
             story_beat=plans[image.scene_number].story_beat,
+            must_show_concepts=plans[image.scene_number].must_show_concepts,
+            concept_visualization=plans[image.scene_number].concept_visualization,
+            scene_purpose=plans[image.scene_number].scene_purpose,
+            relationship_to_thesis=plans[image.scene_number].relationship_to_thesis,
+            narrative_progress=plans[image.scene_number].narrative_progress,
+            visible_evidence=plans[image.scene_number].visible_evidence,
+            forbidden_substitutions=plans[image.scene_number].forbidden_substitutions,
             source_slide_number=plans[image.scene_number].source_slide_number,
+            preserve_source_frame=plans[image.scene_number].preserve_source_frame,
         )
         for image in sorted(prepared.visual_images, key=lambda item: item.scene_number)
     ]
@@ -263,6 +353,7 @@ async def _prepare_job(job_id: str, request: VideoJobRequest) -> None:
             record.view.script_url = f"/v1/videos/{job_id}/script"
             record.view.visual_plan_url = f"/v1/videos/{job_id}/visual-plan"
             record.view.scene_images = _scene_image_views(prepared)
+            record.view.creative_direction = prepared.script.creative_direction
             record.view.status = JobStatus.AWAITING_VISUAL_APPROVAL
             record.view.progress_percent = 55
             record.view.detail = "Revise os slides fixos e os frames dos vídeos"
@@ -371,7 +462,12 @@ async def create_video(
         audience=audience,
         tone=tone,
     )
-    asyncio.create_task(_prepare_job(job_id, request))
+    metadata_path = _request_metadata_path(job_id)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(request.model_dump_json(indent=2), encoding="utf-8")
+    task = asyncio.create_task(_prepare_job(job_id, request))
+    async with _jobs_lock:
+        _jobs[job_id].active_task = task
     logger.info(
         "job=%s accepted file=%s target_seconds=%s language=%s",
         job_id,
@@ -438,7 +534,11 @@ async def regenerate_scene_image(
             ),
             None,
         )
-        if plan is not None and plan.media_mode == MediaMode.STATIC:
+        if (
+            plan is not None
+            and plan.media_mode == MediaMode.STATIC
+            and plan.preserve_source_frame
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="Slides fixos preservam a página original e não usam regeneração por prompt",
@@ -499,7 +599,177 @@ async def approve_visuals(job_id: str) -> JobView:
             job_id,
             len(prepared.visual_images),
         )
-    asyncio.create_task(_finalize_job(job_id, prepared))
+    task = asyncio.create_task(_finalize_job(job_id, prepared))
+    async with _jobs_lock:
+        current_record = _jobs.get(job_id)
+        if current_record is not None:
+            current_record.active_task = task
+    return view
+
+
+@app.post("/v1/videos/{job_id}/resume", response_model=JobView, status_code=202)
+async def resume_video(job_id: str) -> JobView:
+    async with _jobs_lock:
+        record = _jobs.get(job_id)
+        active_task = record.active_task if record is not None else None
+        if job_id in _resuming_jobs or (
+            active_task is not None and not active_task.done()
+        ):
+            raise HTTPException(status_code=409, detail="Job is already running")
+        if record is not None and record.view.status == JobStatus.COMPLETED:
+            return record.view.model_copy(deep=True)
+        if (
+            record is not None
+            and record.view.status == JobStatus.AWAITING_VISUAL_APPROVAL
+            and record.prepared is not None
+        ):
+            return record.view.model_copy(deep=True)
+        if record is not None and record.prepared is not None:
+            prepared = record.prepared
+            request = prepared.request
+            source_path = record.source_path
+        else:
+            uploaded_source = _find_uploaded_source(job_id)
+            if uploaded_source is None:
+                raise HTTPException(status_code=404, detail="Job source file not found")
+            source_path = uploaded_source
+            try:
+                request = _load_resume_request(job_id, source_path)
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise HTTPException(
+                    status_code=409, detail="Job does not have resumable preparation artifacts"
+                ) from exc
+            prepared = None
+        output_dir = settings.output_root / job_id
+        restart_preparation = not (
+            (output_dir / "script.json").is_file()
+            and (output_dir / "visual-plan.json").is_file()
+        )
+        should_finalize = (
+            record.finalization_started
+            if record is not None
+            else _finalization_has_started(job_id)
+        )
+        _resuming_jobs.add(job_id)
+
+    if restart_preparation:
+        now = datetime.now(UTC)
+        async with _jobs_lock:
+            record = _jobs.get(job_id)
+            if record is None:
+                record = JobRecord(
+                    view=JobView(
+                        job_id=job_id,
+                        status=JobStatus.SCRIPTING,
+                        progress_percent=15,
+                        detail="Retomando a criação do roteiro",
+                        file_name=source_path.name,
+                        target_seconds=request.target_seconds,
+                        language=request.language,
+                        audience=request.audience,
+                        tone=request.tone,
+                        created_at=now,
+                        updated_at=now,
+                        debug_mode=settings.debug_mode,
+                    ),
+                    source_path=source_path,
+                )
+                _jobs[job_id] = record
+            else:
+                record.view.status = JobStatus.SCRIPTING
+                record.view.detail = "Retomando a criação do roteiro"
+                record.view.updated_at = now
+                record.prepared = None
+                record.finalization_started = False
+            view = record.view.model_copy(deep=True)
+            _resuming_jobs.discard(job_id)
+        task = asyncio.create_task(_prepare_job(job_id, request))
+        async with _jobs_lock:
+            _jobs[job_id].active_task = task
+        logger.info("job=%s restarting incomplete preparation", job_id)
+        return view
+
+    try:
+        if prepared is None:
+            prepared = await pipeline.restore(request, job_id)
+        now = datetime.now(UTC)
+        async with _jobs_lock:
+            record = _jobs.get(job_id)
+            if record is None:
+                record = JobRecord(
+                    view=JobView(
+                        job_id=job_id,
+                        status=JobStatus.SYNTHESIZING,
+                        progress_percent=55,
+                        detail="Retomando o processamento pelos artefatos existentes",
+                        file_name=source_path.name,
+                        target_seconds=request.target_seconds,
+                        language=request.language,
+                        audience=request.audience,
+                        tone=request.tone,
+                        created_at=now,
+                        updated_at=now,
+                        debug_mode=settings.debug_mode,
+                    ),
+                    source_path=source_path,
+                )
+                _jobs[job_id] = record
+            record.prepared = prepared
+            record.script_path = prepared.script_path
+            record.visual_plan_path = prepared.visual_plan_path
+            record.view.status = (
+                JobStatus.SYNTHESIZING
+                if should_finalize
+                else JobStatus.AWAITING_VISUAL_APPROVAL
+            )
+            record.view.progress_percent = max(record.view.progress_percent, 55)
+            record.view.detail = (
+                "Retomando áudio, animação e renderização"
+                if should_finalize
+                else "Frames recuperados; revise os visuais antes de continuar"
+            )
+            record.view.updated_at = now
+            record.view.script_url = f"/v1/videos/{job_id}/script"
+            record.view.visual_plan_url = f"/v1/videos/{job_id}/visual-plan"
+            record.view.scene_images = _scene_image_views(prepared)
+            record.view.creative_direction = prepared.script.creative_direction
+            record.finalization_started = should_finalize
+            view = record.view.model_copy(deep=True)
+    except FileNotFoundError as exc:
+        async with _jobs_lock:
+            failed_record = _jobs.get(job_id)
+            if failed_record is not None:
+                failed_record.view.status = JobStatus.FAILED
+                failed_record.view.detail = str(exc)
+                failed_record.view.updated_at = datetime.now(UTC)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("job=%s resume failed", job_id)
+        async with _jobs_lock:
+            failed_record = _jobs.get(job_id)
+            if failed_record is not None:
+                failed_record.view.status = JobStatus.FAILED
+                failed_record.view.detail = _public_error_detail(exc)
+                failed_record.view.updated_at = datetime.now(UTC)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Não foi possível retomar o job: {_public_error_detail(exc)}",
+        ) from exc
+    finally:
+        async with _jobs_lock:
+            _resuming_jobs.discard(job_id)
+
+    if should_finalize:
+        task = asyncio.create_task(_finalize_job(job_id, prepared))
+        async with _jobs_lock:
+            current_record = _jobs.get(job_id)
+            if current_record is not None:
+                current_record.active_task = task
+    logger.info(
+        "job=%s resumed from durable artifacts finalization_started=%s",
+        job_id,
+        should_finalize,
+    )
     return view
 
 

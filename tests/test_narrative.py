@@ -4,7 +4,7 @@ from typing import Any, cast
 
 import pytest
 
-from presentation_video.domain.errors import NarrativeDurationError, NarrativeGenerationError
+from presentation_video.domain.errors import NarrativeGenerationError
 from presentation_video.domain.models import PresentationDocument, SlideContent
 from presentation_video.infrastructure.narrative import ReplicateNarrativeGenerator
 from presentation_video.infrastructure.replicate import ReplicatePredictionClient
@@ -92,7 +92,29 @@ async def test_replicate_narrative_revises_script_that_exceeds_duration() -> Non
 
 
 @pytest.mark.asyncio
-async def test_replicate_narrative_exposes_friendly_duration_error() -> None:
+async def test_narrative_accepts_small_final_word_budget_variance() -> None:
+    within_tolerance = {
+        "title": "Presentation",
+        "scenes": [
+            _scene(1, " ".join(["palavra"] * 79)),
+            _scene(2, "Síntese"),
+        ],
+    }
+    fake = FakeReplicateClient([within_tolerance])
+    generator = ReplicateNarrativeGenerator(
+        cast(ReplicatePredictionClient, fake), "owner/model", max_revisions=0
+    )
+
+    result = await generator.generate(
+        _document(), 30, "pt-BR", "executive", "professional"
+    )
+
+    assert len(fake.prompts) == 1
+    assert sum(len(scene.narration.split()) for scene in result.scenes) == 80
+
+
+@pytest.mark.asyncio
+async def test_replicate_narrative_compacts_final_word_budget_overflow() -> None:
     narration = " ".join(["palavra"] * 191)
     too_long = {
         "title": "Presentation",
@@ -103,14 +125,10 @@ async def test_replicate_narrative_exposes_friendly_duration_error() -> None:
         cast(ReplicatePredictionClient, fake), "owner/model", max_revisions=0
     )
 
-    with pytest.raises(NarrativeDurationError) as captured:
-        await generator.generate(_document(), 60, "pt-BR", "executive", "professional")
+    result = await generator.generate(_document(), 60, "pt-BR", "executive", "professional")
 
-    assert "maximum budget is 155 words" in str(captured.value)
-    assert captured.value.user_message == (
-        "O tempo escolhido é muito curto para o conteúdo da apresentação. "
-        "Escolha uma duração maior e tente novamente."
-    )
+    assert sum(len(scene.narration.split()) for scene in result.scenes) <= 155
+    assert result.total_estimated_seconds == 60
 
 
 @pytest.mark.asyncio

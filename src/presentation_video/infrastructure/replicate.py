@@ -12,6 +12,19 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+class ReplicateAPIError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
+
+
 class ReplicatePredictionClient:
     def __init__(
         self,
@@ -24,6 +37,8 @@ class ReplicatePredictionClient:
         self._headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
         self._poll_interval = poll_interval_seconds
         self._timeout = timeout_seconds
+        self._creation_lock = asyncio.Lock()
+        self._max_creation_retries = 5
 
     async def run(self, model: str, inputs: dict[str, object]) -> Any:
         model_name, separator, version = model.partition(":")
@@ -32,7 +47,7 @@ class ReplicatePredictionClient:
             raise ValueError("Replicate model must use 'owner/model' or 'owner/model:version'")
         if separator:
             endpoint = "https://api.replicate.com/v1/predictions"
-            body = {"version": version, "input": inputs}
+            body: dict[str, object] = {"version": version, "input": inputs}
         else:
             endpoint = f"https://api.replicate.com/v1/models/{parts[0]}/{parts[1]}/predictions"
             body = {"input": inputs}
@@ -44,12 +59,7 @@ class ReplicatePredictionClient:
             self._timeout,
         )
         async with httpx.AsyncClient(timeout=70, follow_redirects=True) as client:
-            response = await client.post(
-                endpoint,
-                headers={**self._headers, "Prefer": "wait=60", "Cancel-After": f"{self._timeout}s"},
-                json=body,
-            )
-            self._raise_for_status(response)
+            response = await self._create_prediction(client, endpoint, body, model)
             prediction = response.json()
             prediction_id = prediction.get("id", "unknown")
             logger.info(
@@ -103,6 +113,48 @@ class ReplicatePredictionClient:
             )
             return prediction.get("output")
 
+    async def _create_prediction(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        body: dict[str, object],
+        model: str,
+    ) -> httpx.Response:
+        # Replicate applies the create-prediction limit across models. A single shared
+        # lock prevents image, video and TTS scene tasks from exhausting burst=1 together.
+        async with self._creation_lock:
+            for attempt in range(self._max_creation_retries + 1):
+                response = await client.post(
+                    endpoint,
+                    headers={
+                        **self._headers,
+                        "Prefer": "wait=60",
+                        "Cancel-After": f"{self._timeout}s",
+                    },
+                    json=body,
+                )
+                try:
+                    self._raise_for_status(response)
+                    return response
+                except ReplicateAPIError as exc:
+                    if exc.status_code != 429 or attempt >= self._max_creation_retries:
+                        raise
+                    delay = (
+                        max(exc.retry_after_seconds, 0) + 0.5
+                        if exc.retry_after_seconds is not None
+                        else min(2**attempt, 10)
+                    )
+                    logger.warning(
+                        "replicate prediction throttled model=%s attempt=%s next_attempt=%s "
+                        "delay_seconds=%.1f",
+                        model,
+                        attempt + 1,
+                        attempt + 2,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+        raise RuntimeError("Unreachable Replicate prediction creation retry state")
+
     @staticmethod
     def output_text(output: Any) -> str:
         if isinstance(output, str):
@@ -123,9 +175,25 @@ class ReplicatePredictionClient:
             detail = response.text.strip()
             if len(detail) > 2_000:
                 detail = detail[:2_000] + "..."
-            raise RuntimeError(
+            retry_after: float | None = None
+            header_retry_after = response.headers.get("retry-after")
+            if header_retry_after:
+                try:
+                    retry_after = float(header_retry_after)
+                except ValueError:
+                    pass
+            try:
+                payload = response.json()
+                body_retry_after = payload.get("retry_after") if isinstance(payload, dict) else None
+                if body_retry_after is not None:
+                    retry_after = float(body_retry_after)
+            except (ValueError, TypeError):
+                pass
+            raise ReplicateAPIError(
                 f"Replicate API returned {response.status_code} for {response.request.url}: "
-                f"{detail or response.reason_phrase}"
+                f"{detail or response.reason_phrase}",
+                status_code=response.status_code,
+                retry_after_seconds=retry_after,
             ) from exc
 
     @staticmethod

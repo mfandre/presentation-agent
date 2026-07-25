@@ -31,6 +31,29 @@ export interface VideoJob {
   scene_images: SceneImage[];
   regenerating_scene_numbers: number[];
   debug_mode: boolean;
+  creative_direction: CreativeDirection | null;
+}
+
+export interface CreativeDirection {
+  hook_question: string;
+  throughline: string;
+  visual_motif: string;
+  palette: string[];
+  accent_color: string;
+  pacing: "measured" | "dynamic" | "cinematic";
+  reveal_scene_number: number | null;
+  central_thesis: string;
+  narrative_device: string;
+  transformation_from: string;
+  transformation_to: string;
+  recurring_visual_principle: string;
+  concept_mappings: ConceptMapping[];
+}
+
+export interface ConceptMapping {
+  source_concept: string;
+  target_concept: string;
+  narrative_meaning: string;
 }
 
 export interface SceneImage {
@@ -39,10 +62,32 @@ export interface SceneImage {
   image_url: string;
   prompt: string;
   camera_motion: string;
+  motion_preset: "none" | "slow_push" | "pull_back" | "pan_left" | "pan_right" | "drift_up";
+  entrance_motion: string;
+  focal_action: string;
+  transition_out: string;
+  transition_preset: "cut" | "dissolve" | "fade" | "page_wipe";
+  visual_beats: VisualBeat[];
   revision: number;
   media_mode: "static" | "video";
   story_beat: string;
+  must_show_concepts: string[];
+  concept_visualization: string;
+  scene_purpose: string;
+  relationship_to_thesis: string;
+  narrative_progress: string;
+  visible_evidence: string[];
+  forbidden_substitutions: string[];
   source_slide_number: number | null;
+  preserve_source_frame: boolean;
+}
+
+export interface VisualBeat {
+  beat_number: number;
+  kind: "generated_video" | "generated_image" | "source_slide" | "motion_graphic";
+  duration_seconds: number;
+  motion_preset: "none" | "slow_push" | "pull_back" | "pan_left" | "pan_right" | "drift_up";
+  transition: "cut" | "dissolve" | "fade" | "page_wipe";
 }
 
 export interface CreateVideoInput {
@@ -64,5 +109,6 @@ export interface VideoGateway {
   getVideo(jobId: string): Promise<VideoJob>;
   regenerateScene(jobId: string, sceneNumber: number, prompt: string): Promise<VideoJob>;
   approveVisuals(jobId: string): Promise<VideoJob>;
+  resumeVideo(jobId: string): Promise<VideoJob>;
   assetUrl(path: string): string;
 }

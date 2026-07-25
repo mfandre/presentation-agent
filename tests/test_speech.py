@@ -8,7 +8,7 @@ import pytest
 from pydantic_ai.providers.google import GoogleProvider
 
 from presentation_video.infrastructure import speech
-from presentation_video.infrastructure.replicate import ReplicatePredictionClient
+from presentation_video.infrastructure.replicate import ReplicateAPIError, ReplicatePredictionClient
 from presentation_video.infrastructure.speech import (
     PydanticAIGoogleTTSSynthesizer,
     ReplicateTTSSynthesizer,
@@ -40,6 +40,22 @@ class FakeReplicateClient:
         destination.write_bytes(b"fake-wave")
 
 
+class RateLimitedReplicateClient(FakeReplicateClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def run(self, model: str, inputs: dict[str, object]) -> str:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise ReplicateAPIError(
+                "throttled",
+                status_code=429,
+                retry_after_seconds=7,
+            )
+        return await super().run(model, inputs)
+
+
 @pytest.mark.asyncio
 async def test_replicate_tts_sends_voice_language_and_style(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -62,6 +78,31 @@ async def test_replicate_tts_sends_voice_language_and_style(
     assert fake.inputs["voice"] == "Kore"
     assert fake.inputs["language_code"] == "pt-BR"
     assert "executive" in str(fake.inputs["prompt"])
+
+
+@pytest.mark.asyncio
+async def test_replicate_tts_respects_server_retry_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(speech, "media_duration", _fake_duration)
+    monkeypatch.setattr(speech.asyncio, "sleep", fake_sleep)
+    fake = RateLimitedReplicateClient()
+    synthesizer = ReplicateTTSSynthesizer(
+        cast(ReplicatePredictionClient, fake),
+        "google/gemini-3.1-flash-tts",
+        max_retries=2,
+    )
+
+    artifact = await synthesizer.synthesize("Texto.", tmp_path / "voice.wav")
+
+    assert artifact.duration_seconds == 1.5
+    assert fake.attempts == 2
+    assert delays == [7.5]
 
 
 class FakeInteractions:

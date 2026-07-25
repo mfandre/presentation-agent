@@ -1,8 +1,10 @@
+from typing import Any, cast
+
 import pytest
 import httpx
 
 from presentation_video.domain.models import PresentationVisualPlan, VisualScenePlan
-from presentation_video.infrastructure.replicate import ReplicatePredictionClient
+from presentation_video.infrastructure.replicate import ReplicateAPIError, ReplicatePredictionClient
 
 
 def test_visual_plan_requires_at_least_one_scene() -> None:
@@ -43,3 +45,63 @@ def test_replicate_http_error_includes_api_response_body() -> None:
 
     with pytest.raises(RuntimeError, match="invalid aspect_ratio"):
         ReplicatePredictionClient._raise_for_status(response)
+
+
+def test_replicate_rate_limit_error_preserves_retry_after() -> None:
+    request = httpx.Request("POST", "https://api.replicate.com/v1/predictions")
+    response = httpx.Response(
+        429,
+        request=request,
+        json={"detail": "Request was throttled", "retry_after": 7},
+    )
+
+    with pytest.raises(ReplicateAPIError) as caught:
+        ReplicatePredictionClient._raise_for_status(response)
+
+    assert caught.value.status_code == 429
+    assert caught.value.retry_after_seconds == 7
+
+
+class FakePredictionHTTPClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+        self.calls += 1
+        request = httpx.Request("POST", "https://api.replicate.com/v1/predictions")
+        if self.calls == 1:
+            return httpx.Response(
+                429,
+                request=request,
+                json={"detail": "Request was throttled", "retry_after": 10},
+            )
+        return httpx.Response(
+            201,
+            request=request,
+            json={"id": "prediction-1", "status": "succeeded", "output": "ok"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_replicate_creation_retries_all_models_after_server_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("presentation_video.infrastructure.replicate.asyncio.sleep", fake_sleep)
+    client = ReplicatePredictionClient("token")
+    http_client = FakePredictionHTTPClient()
+
+    response = await client._create_prediction(
+        cast(Any, http_client),
+        "https://api.replicate.com/v1/models/openai/gpt-image-2/predictions",
+        {"input": {"prompt": "test"}},
+        "openai/gpt-image-2",
+    )
+
+    assert response.status_code == 201
+    assert http_client.calls == 2
+    assert delays == [10.5]

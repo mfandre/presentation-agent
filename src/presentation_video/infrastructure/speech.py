@@ -13,7 +13,7 @@ from pydantic_ai.providers.google import GoogleProvider
 from presentation_video.domain.models import AudioArtifact
 from presentation_video.domain.ports import SpeechSynthesizer
 from presentation_video.infrastructure.process import run_process
-from presentation_video.infrastructure.replicate import ReplicatePredictionClient
+from presentation_video.infrastructure.replicate import ReplicateAPIError, ReplicatePredictionClient
 
 logger = logging.getLogger(__name__)
 
@@ -124,16 +124,26 @@ class ReplicateTTSSynthesizer(SpeechSynthesizer):
                     output_path,
                 )
                 return AudioArtifact(path=output_path, duration_seconds=duration)
-            except Exception:
+            except Exception as exc:
                 if attempt >= self._max_retries:
                     raise
+                delay = (
+                    max(exc.retry_after_seconds, 0) + 0.5
+                    if isinstance(exc, ReplicateAPIError)
+                    and exc.status_code == 429
+                    and exc.retry_after_seconds is not None
+                    else min(2**attempt, 4)
+                )
                 logger.warning(
-                    "tts generation retry provider=replicate model=%s next_attempt=%s",
+                    "tts generation retry provider=replicate model=%s next_attempt=%s "
+                    "delay_seconds=%.1f status_code=%s",
                     self._model,
                     attempt + 2,
+                    delay,
+                    exc.status_code if isinstance(exc, ReplicateAPIError) else "unknown",
                     exc_info=True,
                 )
-                await asyncio.sleep(min(2**attempt, 4))
+                await asyncio.sleep(delay)
         raise RuntimeError("Unreachable Replicate TTS retry state")
 
 

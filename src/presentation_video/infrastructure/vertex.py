@@ -117,8 +117,8 @@ class VertexImageAssetGenerator:
         output_dir: Path,
         revision: int = 1,
     ) -> VisualArtifact:
-        if plan.media_mode != MediaMode.VIDEO:
-            raise ValueError("Static scenes must use an unchanged source page")
+        if plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
+            raise ValueError("Preserved static scenes must use an unchanged source page")
 
         prompt = (
             f"{_visual_prompt(plan, source_slides)} "
@@ -266,7 +266,9 @@ class VertexVideoAssetGenerator:
             "Animate the supplied approved image into a short, coherent documentary shot. "
             "Preserve the identity, appearance, position, proportions, and relationships of all "
             "subjects and objects. Use subtle natural subject motion and restrained camera motion "
-            f"at normal speed. Camera direction: {plan.camera_motion.strip()}. Apply that direction "
+            f"at normal speed. Camera direction: {plan.camera_motion.strip()}. "
+            f"Entrance: {plan.entrance_motion}. Focal action: {plan.focal_action}. "
+            f"End by {plan.transition_out}. Apply that direction "
             "only as camera or subject motion; do not turn it into a new object or concept. "
             "Do not morph objects, invent interfaces, or add new visual concepts. "
             "The clip must contain absolutely no words, letters, numbers, captions, subtitles, "

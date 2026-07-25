@@ -1,4 +1,4 @@
-import { ChevronDown, Clock3, Mic2, Sparkles, WandSparkles } from "lucide-react";
+import { ChevronDown, Clock3, History, Mic2, Sparkles, WandSparkles } from "lucide-react";
 import { type FormEvent, useState } from "react";
 
 import type { CreateVideoInput } from "../api/contracts";
@@ -6,7 +6,9 @@ import { FileDropzone } from "./file-dropzone";
 
 interface ConfigurationFormProps {
   disabled: boolean;
+  isResuming: boolean;
   onSubmit(input: CreateVideoInput): Promise<void>;
+  onResume(jobId: string): Promise<void>;
 }
 
 const AUDIENCES = [
@@ -23,13 +25,20 @@ const TONES = [
   { value: "didactic and approachable", label: "Didático e acessível" },
 ];
 
-export function ConfigurationForm({ disabled, onSubmit }: ConfigurationFormProps) {
+export function ConfigurationForm({
+  disabled,
+  isResuming,
+  onSubmit,
+  onResume,
+}: ConfigurationFormProps) {
   const [file, setFile] = useState<File | null>(null);
   const [durationMinutes, setDurationMinutes] = useState(5);
   const [language, setLanguage] = useState("pt-BR");
   const [audience, setAudience] = useState("executive");
   const [tone, setTone] = useState("professional and natural");
   const [fileError, setFileError] = useState<string | null>(null);
+  const [resumeJobId, setResumeJobId] = useState("");
+  const [resumeError, setResumeError] = useState<string | null>(null);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -46,7 +55,19 @@ export function ConfigurationForm({ disabled, onSubmit }: ConfigurationFormProps
     });
   };
 
+  const resume = async (event: FormEvent) => {
+    event.preventDefault();
+    const normalized = resumeJobId.trim().toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(normalized)) {
+      setResumeError("Informe o ID completo do job com 32 caracteres.");
+      return;
+    }
+    setResumeError(null);
+    await onResume(normalized);
+  };
+
   return (
+    <div className="configuration-stack">
     <form className="configuration-form" onSubmit={submit}>
       <section className="form-section">
         <div className="section-heading">
@@ -146,5 +167,38 @@ export function ConfigurationForm({ disabled, onSubmit }: ConfigurationFormProps
       </button>
       <p className="form-footnote">O arquivo é processado cena a cena para permitir retries e edição isolada.</p>
     </form>
+    <form className="resume-job-form" onSubmit={resume}>
+      <div className="resume-job-form__heading">
+        <span><History size={18} /></span>
+        <div>
+          <h2>Retomar processamento</h2>
+          <p>Informe o ID de um job interrompido para continuar usando os artefatos existentes.</p>
+        </div>
+      </div>
+      <label className="resume-job-field">
+        <span>ID do job</span>
+        <input
+          value={resumeJobId}
+          onChange={(event) => {
+            setResumeJobId(event.target.value);
+            setResumeError(null);
+          }}
+          placeholder="e6c0e8a14e034f28b074d48b00500726"
+          spellCheck={false}
+          autoComplete="off"
+          disabled={disabled || isResuming}
+        />
+      </label>
+      {resumeError && <p className="field-error">{resumeError}</p>}
+      <button
+        type="submit"
+        className="secondary-button resume-job-button"
+        disabled={disabled || isResuming || !resumeJobId.trim()}
+      >
+        <History size={17} />
+        {isResuming ? "Retomando…" : "Retomar pelo ID"}
+      </button>
+    </form>
+    </div>
   );
 }
