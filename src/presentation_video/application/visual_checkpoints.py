@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+
+from presentation_video.application.cinematic import materialize_shot
+from presentation_video.application.production_policy import shots_or_default
+from presentation_video.domain.models import (
+    JobStatus,
+    MediaMode,
+    PreparedVideoJob,
+    PresentationScript,
+    PresentationVisualPlan,
+    VideoJobRequest,
+    VisualArtifact,
+)
+from presentation_video.domain.ports import (
+    DocumentIngestorFactory,
+    JobReporter,
+    VisualAssetGenerator,
+)
+from presentation_video.infrastructure.visual_planning import validate_sequence
+
+logger = logging.getLogger(__name__)
+
+
+async def restore_prepared_job(
+    request: VideoJobRequest,
+    job_id: str,
+    *,
+    work_root: Path,
+    output_root: Path,
+    ingestor_factory: DocumentIngestorFactory,
+    visual_asset_generator: VisualAssetGenerator,
+    reporter: JobReporter,
+) -> PreparedVideoJob:
+    """Rebuild a prepared job and generate only missing visual artifacts."""
+
+    work_dir = work_root / job_id
+    output_dir = output_root / job_id
+    script_path = output_dir / "script.json"
+    visual_plan_path = output_dir / "visual-plan.json"
+    if not request.source_path.is_file():
+        raise FileNotFoundError(f"Source file not found for job {job_id}")
+    if not script_path.is_file() or not visual_plan_path.is_file():
+        raise FileNotFoundError(f"Job {job_id} has not completed visual preparation")
+
+    document = await ingestor_factory.create(request.source_path).ingest(
+        request.source_path,
+        work_dir,
+    )
+    script = PresentationScript.model_validate_json(script_path.read_text(encoding="utf-8"))
+    visual_plan = PresentationVisualPlan.model_validate_json(
+        visual_plan_path.read_text(encoding="utf-8")
+    )
+    validate_sequence(visual_plan, script, document)
+    visual_plan_path.write_text(visual_plan.model_dump_json(indent=2), encoding="utf-8")
+    slides = {slide.number: slide for slide in document.slides}
+    scripts = {scene.scene_number: scene for scene in script.scenes}
+    images: list[VisualArtifact] = []
+    completed_images = 0
+    shot_total = sum(max(len(plan.shots), 1) for plan in visual_plan.scenes)
+    for scene_plan in visual_plan.scenes:
+        for shot in shots_or_default(scene_plan.shots):
+            shot_number = shot.shot_number if shot else 1
+            plan = materialize_shot(scene_plan, shot) if shot else scene_plan
+            if plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
+                source_number = plan.source_slide_number or plan.source_slide_numbers[0]
+                try:
+                    image_path = slides[source_number].image_path
+                except KeyError as exc:
+                    raise FileNotFoundError(
+                        f"Source slide {source_number} is unavailable for scene "
+                        f"{plan.scene_number}"
+                    ) from exc
+                revision = 1
+            else:
+                stem = f"scene-{plan.scene_number:03d}"
+                if shot_number > 1:
+                    stem += f"-shot-{shot_number:03d}"
+                candidates = sorted((work_dir / "images").glob(f"{stem}-r*.*"))
+                if not candidates:
+                    scene_script = scripts[plan.scene_number]
+                    source_slides = [
+                        slides[number] for number in scene_script.source_slide_numbers
+                    ]
+                    logger.info(
+                        "job=%s restoring missing generated image scene=%s shot=%s",
+                        job_id,
+                        plan.scene_number,
+                        shot_number,
+                    )
+                    image = await visual_asset_generator.generate(
+                        plan,
+                        source_slides,
+                        work_dir / "images",
+                    )
+                    image_path = image.path
+                    revision = image.revision
+                else:
+                    image_path = candidates[-1]
+                    match = image_path.stem.rsplit("-r", 1)
+                    revision = (
+                        int(match[1])
+                        if len(match) == 2 and match[1].isdigit()
+                        else 1
+                    )
+            images.append(
+                VisualArtifact(
+                    scene_number=plan.scene_number,
+                    shot_number=shot_number,
+                    path=image_path,
+                    kind="image",
+                    revision=revision,
+                )
+            )
+            completed_images += 1
+            await reporter.update(
+                job_id,
+                JobStatus.GENERATING_IMAGES,
+                f"completed={completed_images} total={shot_total}"
+                f" | frame da cena {plan.scene_number}, take {shot_number} recuperado",
+            )
+
+    return PreparedVideoJob(
+        job_id=job_id,
+        request=request,
+        document=document,
+        script=script,
+        visual_plan=visual_plan,
+        visual_images=images,
+        work_dir=work_dir,
+        output_dir=output_dir,
+        script_path=script_path,
+        visual_plan_path=visual_plan_path,
+    )
+
+
+async def regenerate_visual(
+    prepared: PreparedVideoJob,
+    scene_number: int,
+    shot_number: int,
+    prompt: str | None,
+    *,
+    visual_asset_generator: VisualAssetGenerator,
+    semaphore: asyncio.Semaphore,
+) -> VisualArtifact:
+    """Regenerate one reviewable visual while preserving the approved checkpoint."""
+
+    slides = {slide.number: slide for slide in prepared.document.slides}
+    scripts = {scene.scene_number: scene for scene in prepared.script.scenes}
+    plans = {plan.scene_number: plan for plan in prepared.visual_plan.scenes}
+    images = {
+        (image.scene_number, image.shot_number): image
+        for image in prepared.visual_images
+    }
+    image_key = (scene_number, shot_number)
+    if scene_number not in scripts or scene_number not in plans or image_key not in images:
+        raise ValueError(f"Scene {scene_number}, shot {shot_number} does not exist")
+    if (
+        plans[scene_number].media_mode == MediaMode.STATIC
+        and plans[scene_number].preserve_source_frame
+    ):
+        raise ValueError(
+            "Static scenes preserve an original source page and cannot be regenerated "
+            "from a prompt"
+        )
+    scene_plan = plans[scene_number]
+    shot = scene_plan.shots[shot_number - 1] if scene_plan.shots else None
+    generation_plan = materialize_shot(scene_plan, shot) if shot else scene_plan
+    previous_prompt = generation_plan.prompt
+    if prompt is not None:
+        if shot:
+            shot.prompt = prompt.strip()
+            generation_plan = materialize_shot(scene_plan, shot)
+        else:
+            scene_plan.prompt = prompt.strip()
+            generation_plan = scene_plan
+    revision = images[image_key].revision + 1
+    logger.info(
+        "job=%s image regeneration started scene=%s shot=%s revision=%s "
+        "prompt_updated=%s prompt_characters=%s",
+        prepared.job_id,
+        scene_number,
+        shot_number,
+        revision,
+        prompt is not None,
+        len(generation_plan.prompt),
+    )
+    try:
+        async with semaphore:
+            replacement = await visual_asset_generator.generate(
+                generation_plan,
+                [slides[number] for number in scripts[scene_number].source_slide_numbers],
+                prepared.work_dir / "images",
+                revision=revision,
+            )
+    except Exception:
+        if shot:
+            shot.prompt = previous_prompt
+        else:
+            scene_plan.prompt = previous_prompt
+        raise
+    prepared.visual_plan_path.write_text(
+        prepared.visual_plan.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    prepared.visual_images = [
+        replacement
+        if (image.scene_number, image.shot_number) == image_key
+        else image
+        for image in prepared.visual_images
+    ]
+    logger.info(
+        "job=%s image regeneration completed scene=%s shot=%s revision=%s path=%s",
+        prepared.job_id,
+        scene_number,
+        shot_number,
+        revision,
+        replacement.path,
+    )
+    return replacement
