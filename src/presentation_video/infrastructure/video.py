@@ -38,11 +38,7 @@ class FfmpegSceneRenderer(SceneRenderer):
     ) -> SceneArtifact:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         target_duration = max(audio.duration_seconds, 0.1)
-        if (
-            presenter_video is None
-            and visual_plan is not None
-            and visual_plan.visual_beats
-        ):
+        if presenter_video is None and visual_plan is not None and visual_plan.visual_beats:
             return await self._render_visual_beats(
                 scene_number=scene_number,
                 source_slide=source_slide,

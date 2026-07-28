@@ -48,7 +48,10 @@ def test_visual_prompt_requires_agentic_ai_instead_of_generic_industry() -> None
 
     prompt = _visual_prompt(plan)
 
-    assert "Required concepts that must be visually unmistakable: Agentic AI, human governance" in prompt
+    assert (
+        "Required concepts that must be visually unmistakable: Agentic AI, human governance"
+        in prompt
+    )
     assert "distinct software agents handing tasks to tools" in prompt
     assert "Do not substitute these concepts with generic teamwork" in prompt
     assert "Never depict AI as a robot" in prompt

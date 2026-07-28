@@ -296,9 +296,7 @@ def _build_script(generated: _LLMPresentationScript, target_seconds: int) -> Pre
                 visual_intent=scene.visual_intent,
                 transition_to_next=scene.transition_to_next,
                 scene_purpose=scene.scene_purpose or scene.visual_intent,
-                relationship_to_thesis=(
-                    scene.relationship_to_thesis or direction.central_thesis
-                ),
+                relationship_to_thesis=(scene.relationship_to_thesis or direction.central_thesis),
                 narrative_progress=scene.narrative_progress or scene.story_beat,
             )
             for scene, duration in zip(generated.scenes, durations, strict=True)
@@ -510,7 +508,11 @@ class DebugNarrativeGenerator(NarrativeGenerator):
             source_text = " ".join(
                 part
                 for slide in source_slides
-                for part in (slide.title.strip(), slide.body_text.strip(), slide.speaker_notes.strip())
+                for part in (
+                    slide.title.strip(),
+                    slide.body_text.strip(),
+                    slide.speaker_notes.strip(),
+                )
                 if part
             )
             normalized = " ".join(source_text.split())
@@ -527,11 +529,7 @@ class DebugNarrativeGenerator(NarrativeGenerator):
                 if scene_count > 1 and index % 2 == 0 and not is_last
                 else MediaMode.STATIC
             )
-            story_beat = (
-                "opening"
-                if index == 0
-                else "conclusion" if is_last else "development"
-            )
+            story_beat = "opening" if index == 0 else "conclusion" if is_last else "development"
             scenes.append(
                 _LLMSceneScript(
                     scene_number=index + 1,
@@ -553,7 +551,9 @@ class DebugNarrativeGenerator(NarrativeGenerator):
                     scene_purpose=(
                         "Establish the source topic"
                         if index == 0
-                        else "Resolve the source argument" if is_last else "Develop the source evidence"
+                        else "Resolve the source argument"
+                        if is_last
+                        else "Develop the source evidence"
                     ),
                     relationship_to_thesis=(
                         "Connect this source section to the presentation's central evidence"
@@ -561,7 +561,9 @@ class DebugNarrativeGenerator(NarrativeGenerator):
                     narrative_progress=(
                         "Open the argument"
                         if index == 0
-                        else "Conclude the argument" if is_last else "Add supporting evidence"
+                        else "Conclude the argument"
+                        if is_last
+                        else "Add supporting evidence"
                     ),
                 )
             )
@@ -603,7 +605,13 @@ class DebugNarrativeGenerator(NarrativeGenerator):
 
 
 class PydanticAINarrativeGenerator(NarrativeGenerator):
-    def __init__(self, model: str, max_revisions: int = 2, words_per_minute: int = 155) -> None:
+    def __init__(
+        self,
+        model: str,
+        max_revisions: int = 2,
+        words_per_minute: int = 155,
+        allow_duration_review: bool = False,
+    ) -> None:
         # Strategy is selected through configuration, e.g. openai:..., anthropic:..., google:...
         self._agent = Agent(
             model,
@@ -613,6 +621,7 @@ class PydanticAINarrativeGenerator(NarrativeGenerator):
         )
         self._max_revisions = max_revisions
         self._words_per_minute = words_per_minute
+        self._allow_duration_review = allow_duration_review
 
     async def generate(
         self,
@@ -644,6 +653,10 @@ class PydanticAINarrativeGenerator(NarrativeGenerator):
         script = result.output
         for revision in range(self._max_revisions + 1):
             issues = _script_issues(script, document, target_seconds, self._words_per_minute)
+            if self._allow_duration_review and _only_word_budget_issue(issues):
+                word_count = sum(len(scene.narration.split()) for scene in script.scenes)
+                estimated_seconds = math.ceil(word_count * 60 / self._words_per_minute)
+                return _build_script(script, estimated_seconds)
             if not issues:
                 final_script = _build_script(script, target_seconds)
                 logger.info(
@@ -700,12 +713,14 @@ class ReplicateNarrativeGenerator(NarrativeGenerator):
         input_defaults: dict[str, object] | None = None,
         max_revisions: int = 2,
         words_per_minute: int = 155,
+        allow_duration_review: bool = False,
     ) -> None:
         self._client = client
         self._model = model
         self._input_defaults = input_defaults or {}
         self._max_revisions = max_revisions
         self._words_per_minute = words_per_minute
+        self._allow_duration_review = allow_duration_review
 
     async def generate(
         self,
@@ -750,6 +765,10 @@ class ReplicateNarrativeGenerator(NarrativeGenerator):
                 prompt = _structured_revision_prompt(failed_prompt, text, summary, schema)
                 continue
             issues = _script_issues(script, document, target_seconds, self._words_per_minute)
+            if self._allow_duration_review and _only_word_budget_issue(issues):
+                word_count = sum(len(scene.narration.split()) for scene in script.scenes)
+                estimated_seconds = math.ceil(word_count * 60 / self._words_per_minute)
+                return _build_script(script, estimated_seconds)
             if not issues:
                 final_script = _build_script(script, target_seconds)
                 logger.info(

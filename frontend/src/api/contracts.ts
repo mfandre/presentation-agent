@@ -2,14 +2,22 @@ export type JobStatus =
   | "received"
   | "ingesting"
   | "scripting"
+  | "duration_validating"
+  | "awaiting_duration_approval"
+  | "synthesizing"
+  | "scene_planning"
   | "visual_planning"
+  | "prompt_compiling"
+  | "rule_validating"
   | "generating_images"
   | "awaiting_visual_approval"
   | "generating_video"
-  | "synthesizing"
+  | "visual_qa"
   | "rendering"
   | "assembling"
+  | "captioning"
   | "completed"
+  | "cancelled"
   | "failed";
 
 export interface VideoJob {
@@ -19,20 +27,30 @@ export interface VideoJob {
   detail: string;
   file_name: string;
   target_seconds: number;
+  requested_target_seconds: number | null;
+  estimated_duration_seconds: number | null;
+  narration_word_count: number | null;
   language: string;
   audience: string;
   tone: string;
+  production_mode: ProductionMode;
   created_at: string;
   updated_at: string;
+  start_datetime: string;
+  end_datetime: string | null;
   duration_seconds: number | null;
   video_url: string | null;
   script_url: string | null;
   visual_plan_url: string | null;
+  captions_vtt_url: string | null;
+  captions_srt_url: string | null;
   scene_images: SceneImage[];
   regenerating_scene_numbers: number[];
   debug_mode: boolean;
   creative_direction: CreativeDirection | null;
 }
+
+export type ProductionMode = "hybrid_presentation" | "cinematic_story";
 
 export interface CreativeDirection {
   hook_question: string;
@@ -58,6 +76,10 @@ export interface ConceptMapping {
 
 export interface SceneImage {
   scene_number: number;
+  shot_number: number;
+  shot_duration_seconds: number | null;
+  narration_excerpt: string;
+  story_function: string;
   source_slide_numbers: number[];
   image_url: string;
   prompt: string;
@@ -96,19 +118,98 @@ export interface CreateVideoInput {
   language: string;
   audience: string;
   tone: string;
+  productionMode: ProductionMode;
 }
 
 export interface RuntimeConfig {
   debug_mode: boolean;
   debug_max_scenes: number | null;
+  debug_replay_job_id: string | null;
+}
+
+export type WorkflowRunStatus =
+  | "pending"
+  | "running"
+  | "waiting"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type WorkflowStepStatus =
+  | "pending"
+  | "running"
+  | "waiting"
+  | "completed"
+  | "failed"
+  | "skipped";
+
+export interface WorkflowStepDefinition {
+  id: string;
+  uses: string;
+  needs: string[];
+  inputs: Record<string, unknown>;
+  config: Record<string, unknown>;
+  outputs: Record<string, string>;
+  when: boolean | string;
+  foreach: string | null;
+  parallelism: number;
+  retry: {
+    attempts: number;
+    backoff_seconds: number;
+    exponential: boolean;
+  };
+  checkpoint: "human" | null;
+  timeout_seconds: number | null;
+  continue_on_error: boolean;
+}
+
+export interface WorkflowDefinition {
+  id: string;
+  version: string;
+  description: string;
+  inputs: Record<string, { type: string; required: boolean; default: unknown }>;
+  settings: Record<string, unknown>;
+  steps: WorkflowStepDefinition[];
+}
+
+export interface WorkflowStepRun {
+  run_id: string;
+  step_id: string;
+  uses: string;
+  status: WorkflowStepStatus;
+  attempt: number;
+  inputs: Record<string, unknown>;
+  outputs: Record<string, unknown>;
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface WorkflowSnapshot {
+  run: {
+    run_id: string;
+    workflow_id: string;
+    workflow_version: string;
+    status: WorkflowRunStatus;
+    inputs: Record<string, unknown>;
+    outputs: Record<string, unknown>;
+    error: string | null;
+    created_at: string;
+    updated_at: string;
+  };
+  steps: WorkflowStepRun[];
+  definition: WorkflowDefinition | null;
 }
 
 export interface VideoGateway {
   getRuntimeConfig(): Promise<RuntimeConfig>;
+  getWorkflows(): Promise<WorkflowDefinition[]>;
+  getWorkflowRun(jobId: string): Promise<WorkflowSnapshot>;
   createVideo(input: CreateVideoInput): Promise<VideoJob>;
   getVideo(jobId: string): Promise<VideoJob>;
-  regenerateScene(jobId: string, sceneNumber: number, prompt: string): Promise<VideoJob>;
+  regenerateScene(jobId: string, sceneNumber: number, shotNumber: number, prompt: string): Promise<VideoJob>;
   approveVisuals(jobId: string): Promise<VideoJob>;
+  decideDuration(jobId: string, decision: "summarize" | "accept" | "cancel"): Promise<VideoJob>;
   resumeVideo(jobId: string): Promise<VideoJob>;
   assetUrl(path: string): string;
 }

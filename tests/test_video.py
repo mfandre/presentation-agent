@@ -68,12 +68,8 @@ async def test_visual_beat_timeline_uses_generated_clip_once_without_loop(
     monkeypatch.setattr(video, "media_duration", fake_duration)
     slide = SlideContent(number=1, image_path=tmp_path / "slide.png")
     audio = AudioArtifact(path=tmp_path / "audio.wav", duration_seconds=20)
-    generated_image = VisualArtifact(
-        scene_number=1, path=tmp_path / "image.jpg", kind="image"
-    )
-    generated_clip = VisualArtifact(
-        scene_number=1, path=tmp_path / "clip.mp4", kind="video"
-    )
+    generated_image = VisualArtifact(scene_number=1, path=tmp_path / "image.jpg", kind="image")
+    generated_clip = VisualArtifact(scene_number=1, path=tmp_path / "clip.mp4", kind="video")
     plan = VisualScenePlan(
         scene_number=1,
         source_slide_numbers=[1],

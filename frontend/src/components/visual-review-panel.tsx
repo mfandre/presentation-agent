@@ -17,7 +17,7 @@ interface VisualReviewPanelProps {
   isActing: boolean;
   error: string | null;
   assetUrl(path: string): string;
-  onRegenerate(sceneNumber: number, prompt: string): Promise<void>;
+  onRegenerate(sceneNumber: number, shotNumber: number, prompt: string): Promise<void>;
   onApprove(): Promise<void>;
 }
 
@@ -48,10 +48,10 @@ export function VisualReviewPanel({
   onRegenerate,
   onApprove,
 }: VisualReviewPanelProps) {
-  const [editedPrompts, setEditedPrompts] = useState<Record<number, string>>({});
-  const [openEditors, setOpenEditors] = useState<Record<number, boolean>>(() => {
-    const firstScene = job.scene_images.find((scene) => scene.media_mode === "video")?.scene_number;
-    return firstScene ? { [firstScene]: true } : {};
+  const [editedPrompts, setEditedPrompts] = useState<Record<string, string>>({});
+  const [openEditors, setOpenEditors] = useState<Record<string, boolean>>(() => {
+    const first = job.scene_images.find((scene) => scene.media_mode === "video");
+    return first ? { [`${first.scene_number}-${first.shot_number}`]: true } : {};
   });
 
   const staticCount = job.scene_images.filter((scene) => scene.preserve_source_frame).length;
@@ -60,10 +60,10 @@ export function VisualReviewPanel({
   ).length;
   const videoCount = job.scene_images.filter((scene) => scene.media_mode === "video").length;
 
-  const toggleEditor = (sceneNumber: number) => {
+  const toggleEditor = (key: string) => {
     setOpenEditors((current) => ({
       ...current,
-      [sceneNumber]: !current[sceneNumber],
+      [key]: !current[key],
     }));
   };
 
@@ -73,14 +73,22 @@ export function VisualReviewPanel({
         <span className="review-icon"><Image size={22} /></span>
         <div>
           <span>Revisão visual</span>
-          <h2>Aprove o storyboard híbrido</h2>
-          <p>Slides fixos preservam informações legíveis. Somente os frames marcados como vídeo serão animados.</p>
+          <h2>
+            {job.production_mode === "cinematic_story"
+              ? "Aprove o storyboard cinematográfico"
+              : "Aprove o storyboard híbrido"}
+          </h2>
+          <p>
+            {job.production_mode === "cinematic_story"
+              ? "Cada cartão é um take de até 8 segundos, sincronizado a um trecho específico da narração."
+              : "Slides fixos preservam informações legíveis. Somente os frames marcados como vídeo serão animados."}
+          </p>
         </div>
       </div>
 
       <div className="visual-review__tip">
         <Sparkles size={17} />
-        <span><strong>{job.debug_mode ? "Modo debug ativo." : "Ritmo editorial planejado."}</strong> {job.debug_mode ? "Nenhuma regeneração chama APIs pagas." : `${staticCount} páginas visuais serão preservadas, ${illustrationCount} cenas terão ilustrações editoriais e ${videoCount} cenas usarão movimento sem palavras.`}</span>
+        <span><strong>{job.debug_mode ? "Modo debug ativo." : "Ritmo editorial planejado."}</strong> {job.debug_mode ? "Nenhuma regeneração chama APIs pagas." : job.production_mode === "cinematic_story" ? `${videoCount} takes serão gerados e compostos sem loops nem slides fixos.` : `${staticCount} páginas visuais serão preservadas, ${illustrationCount} cenas terão ilustrações editoriais e ${videoCount} cenas usarão movimento sem palavras.`}</span>
       </div>
 
       {job.creative_direction && (
@@ -134,19 +142,20 @@ export function VisualReviewPanel({
 
       <div className="visual-grid">
         {job.scene_images.map((scene) => {
+          const shotKey = `${scene.scene_number}-${scene.shot_number}`;
           const isVideo = scene.media_mode === "video";
           const regenerating = job.regenerating_scene_numbers.includes(scene.scene_number);
-          const editedPrompt = editedPrompts[scene.scene_number] ?? scene.prompt;
-          const editorOpen = Boolean(openEditors[scene.scene_number]);
-          const editorId = `scene-${scene.scene_number}-prompt-editor`;
+          const editedPrompt = editedPrompts[shotKey] ?? scene.prompt;
+          const editorOpen = Boolean(openEditors[shotKey]);
+          const editorId = `scene-${scene.scene_number}-shot-${scene.shot_number}-prompt-editor`;
           return (
             <article
               className={`visual-card visual-card--${scene.media_mode}${editorOpen ? " visual-card--editing" : ""}`}
-              key={`${scene.scene_number}-${scene.revision}`}
+              key={`${shotKey}-${scene.revision}`}
             >
               <div className="visual-card__image">
                 <img src={assetUrl(scene.image_url)} alt={`Frame planejado para a cena ${scene.scene_number}`} />
-                <span>Cena {scene.scene_number}</span>
+                <span>Cena {scene.scene_number} · take {scene.shot_number}</span>
                 <small>versão {scene.revision}</small>
                 <em className={`visual-card__mode visual-card__mode--${scene.media_mode}`}>
                   {isVideo ? <Clapperboard size={13} /> : <FileText size={13} />}
@@ -159,7 +168,7 @@ export function VisualReviewPanel({
                   type="button"
                   aria-expanded={editorOpen}
                   aria-controls={editorId}
-                  onClick={() => toggleEditor(scene.scene_number)}
+                  onClick={() => toggleEditor(shotKey)}
                 >
                   <PencilLine size={15} />
                   {editorOpen ? "Fechar editor" : "Editar prompt e regenerar"}
@@ -170,7 +179,7 @@ export function VisualReviewPanel({
               {(isVideo || !scene.preserve_source_frame) && editorOpen && <div className="visual-card__body" id={editorId}>
                 <div className="visual-card__editor-heading">
                   <div>
-                    <strong>Personalize a imagem da cena {scene.scene_number}</strong>
+                    <strong>Personalize o take {scene.shot_number} da cena {scene.scene_number}</strong>
                     <span>
                       Baseado nas páginas {formatSourcePages(scene.source_slide_numbers)}. Descreva
                       uma ação ou ambiente sem palavras e gere somente este frame novamente.
@@ -187,7 +196,7 @@ export function VisualReviewPanel({
                     aria-label={`Prompt da imagem da cena ${scene.scene_number}`}
                     onChange={(event) => setEditedPrompts((current) => ({
                       ...current,
-                      [scene.scene_number]: event.target.value,
+                      [shotKey]: event.target.value,
                     }))}
                   />
                 </label>
@@ -206,6 +215,13 @@ export function VisualReviewPanel({
                     {scene.narrative_progress && <small>Avanço: {scene.narrative_progress}</small>}
                   </div>
                 )}
+                {scene.narration_excerpt && (
+                  <div className="visual-card__concepts">
+                    <strong>Trecho sincronizado · {scene.shot_duration_seconds?.toFixed(1)}s</strong>
+                    <span>{scene.narration_excerpt}</span>
+                    <small>Função: {scene.story_function.replaceAll("_", " ")}</small>
+                  </div>
+                )}
                 <span><Sparkles size={13} /> {scene.camera_motion} · {scene.motion_preset.replaceAll("_", " ")}</span>
                 <span><Clapperboard size={13} /> {scene.entrance_motion} → {scene.transition_out}</span>
                 {(scene.visual_beats ?? []).length > 0 && (
@@ -221,7 +237,11 @@ export function VisualReviewPanel({
                   className="secondary-button visual-card__action"
                   type="button"
                   disabled={isActing || regenerating || editedPrompt.trim().length < 3}
-                  onClick={() => void onRegenerate(scene.scene_number, editedPrompt.trim())}
+                  onClick={() => void onRegenerate(
+                    scene.scene_number,
+                    scene.shot_number,
+                    editedPrompt.trim(),
+                  )}
                 >
                   {regenerating ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
                   {regenerating ? "Gerando nova versão..." : "Regenerar imagem com este prompt"}

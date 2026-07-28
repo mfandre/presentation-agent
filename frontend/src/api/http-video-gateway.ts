@@ -1,4 +1,11 @@
-import type { CreateVideoInput, RuntimeConfig, VideoGateway, VideoJob } from "./contracts";
+import type {
+  CreateVideoInput,
+  RuntimeConfig,
+  VideoGateway,
+  VideoJob,
+  WorkflowDefinition,
+  WorkflowSnapshot,
+} from "./contracts";
 
 interface ApiErrorPayload {
   detail?: string;
@@ -18,6 +25,14 @@ export class HttpVideoGateway implements VideoGateway {
     return this.request<RuntimeConfig>("/v1/config");
   }
 
+  async getWorkflows(): Promise<WorkflowDefinition[]> {
+    return this.request<WorkflowDefinition[]>("/v1/workflows");
+  }
+
+  async getWorkflowRun(jobId: string): Promise<WorkflowSnapshot> {
+    return this.request<WorkflowSnapshot>(`/v1/workflow-runs/${jobId}`);
+  }
+
   async createVideo(input: CreateVideoInput): Promise<VideoJob> {
     const form = new FormData();
     form.append("file", input.file);
@@ -25,6 +40,7 @@ export class HttpVideoGateway implements VideoGateway {
     form.append("language", input.language);
     form.append("audience", input.audience);
     form.append("tone", input.tone);
+    form.append("production_mode", input.productionMode);
 
     return this.request<VideoJob>("/v1/videos", {
       method: "POST",
@@ -36,8 +52,8 @@ export class HttpVideoGateway implements VideoGateway {
     return this.request<VideoJob>(`/v1/videos/${jobId}`);
   }
 
-  async regenerateScene(jobId: string, sceneNumber: number, prompt: string): Promise<VideoJob> {
-    return this.request<VideoJob>(`/v1/videos/${jobId}/scenes/${sceneNumber}/regenerate`, {
+  async regenerateScene(jobId: string, sceneNumber: number, shotNumber: number, prompt: string): Promise<VideoJob> {
+    return this.request<VideoJob>(`/v1/videos/${jobId}/scenes/${sceneNumber}/regenerate?shot_number=${shotNumber}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt }),
@@ -46,6 +62,14 @@ export class HttpVideoGateway implements VideoGateway {
 
   async approveVisuals(jobId: string): Promise<VideoJob> {
     return this.request<VideoJob>(`/v1/videos/${jobId}/approve-visuals`, { method: "POST" });
+  }
+
+  async decideDuration(jobId: string, decision: "summarize" | "accept" | "cancel"): Promise<VideoJob> {
+    return this.request<VideoJob>(`/v1/videos/${jobId}/duration-decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision }),
+    });
   }
 
   async resumeVideo(jobId: string): Promise<VideoJob> {

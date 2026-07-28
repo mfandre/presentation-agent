@@ -7,18 +7,26 @@ interface UseVideoCreationResult {
   job: VideoJob | null;
   debugMode: boolean;
   debugMaxScenes: number | null;
+  debugReplayJobId: string | null;
   isSubmitting: boolean;
   isActing: boolean;
   error: string | null;
   createVideo(input: CreateVideoInput): Promise<void>;
-  regenerateScene(sceneNumber: number, prompt: string): Promise<void>;
+  regenerateScene(sceneNumber: number, shotNumber: number, prompt: string): Promise<void>;
   approveVisuals(): Promise<void>;
+  decideDuration(decision: "summarize" | "accept" | "cancel"): Promise<void>;
   resumeVideo(jobId?: string): Promise<void>;
   reset(): void;
   assetUrl(path: string): string;
 }
 
-const POLLING_STOP_STATUSES = new Set(["awaiting_visual_approval", "completed", "failed"]);
+const POLLING_STOP_STATUSES = new Set([
+  "awaiting_duration_approval",
+  "awaiting_visual_approval",
+  "completed",
+  "cancelled",
+  "failed",
+]);
 const STORED_JOB_KEY = "presentation-video-active-job";
 
 const defaultGateway: VideoGateway = new HttpVideoGateway();
@@ -53,6 +61,7 @@ export function useVideoCreation(
   const [job, setJob] = useState<VideoJob | null>(loadStoredJob);
   const [debugMode, setDebugMode] = useState(false);
   const [debugMaxScenes, setDebugMaxScenes] = useState<number | null>(null);
+  const [debugReplayJobId, setDebugReplayJobId] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isActing, setIsActing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -64,6 +73,7 @@ export function useVideoCreation(
       if (cancelled) return;
       setDebugMode(config.debug_mode);
       setDebugMaxScenes(config.debug_max_scenes);
+      setDebugReplayJobId(config.debug_replay_job_id);
     }).catch(() => {
       // Job responses still carry debug_mode, so a transient config failure is non-blocking.
     });
@@ -136,7 +146,7 @@ export function useVideoCreation(
     };
   }, [gateway, job]);
 
-  const regenerateScene = useCallback(async (sceneNumber: number, prompt: string) => {
+  const regenerateScene = useCallback(async (sceneNumber: number, shotNumber: number, prompt: string) => {
     if (!job) return;
     setIsActing(true);
     setError(null);
@@ -145,7 +155,7 @@ export function useVideoCreation(
       regenerating_scene_numbers: [sceneNumber],
     } : current);
     try {
-      setJob(await gateway.regenerateScene(job.job_id, sceneNumber, prompt));
+      setJob(await gateway.regenerateScene(job.job_id, sceneNumber, shotNumber, prompt));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Não foi possível regenerar a imagem.");
     } finally {
@@ -162,6 +172,19 @@ export function useVideoCreation(
       setJob(await gateway.approveVisuals(job.job_id));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Não foi possível aprovar os visuais.");
+    } finally {
+      setIsActing(false);
+    }
+  }, [gateway, job]);
+
+  const decideDuration = useCallback(async (decision: "summarize" | "accept" | "cancel") => {
+    if (!job) return;
+    setIsActing(true);
+    setError(null);
+    try {
+      setJob(await gateway.decideDuration(job.job_id, decision));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Não foi possível registrar a decisão.");
     } finally {
       setIsActing(false);
     }
@@ -193,12 +216,14 @@ export function useVideoCreation(
     job,
     debugMode: debugMode || Boolean(job?.debug_mode),
     debugMaxScenes,
+    debugReplayJobId,
     isSubmitting,
     isActing,
     error,
     createVideo,
     regenerateScene,
     approveVisuals,
+    decideDuration,
     resumeVideo,
     reset,
     assetUrl: (path: string) => gateway.assetUrl(path),

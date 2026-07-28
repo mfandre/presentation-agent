@@ -1,0 +1,179 @@
+id: presentation-video-pydantic-ai
+version: 2.3.0
+description: Pydantic AI para roteiro e direção visual, com mídia no Google Vertex AI.
+
+inputs:
+  source_path:
+    type: file
+    required: true
+  target_seconds:
+    type: integer
+    default: 600
+  language:
+    type: string
+    default: pt-BR
+  audience:
+    type: string
+    default: executive
+  tone:
+    type: string
+    default: professional and natural
+  production_mode:
+    type: string
+    default: hybrid_presentation
+
+settings:
+  state_backend: sqlite
+  artifacts: external_storage
+  authentication: google_adc
+
+steps:
+  - id: ingest
+    uses: document.ingest
+    outputs:
+      document: presentation_document
+
+  - id: narrative
+    uses: narrative.plan
+    needs: [ingest]
+    config:
+      provider: pydantic_ai
+      model: google-cloud:gemini-3.5-flash
+      location: global
+      max_revisions: 3
+      words_per_minute: 155
+      debug:
+        max_scenes: 3
+    retry:
+      attempts: 3
+      backoff_seconds: 1
+
+  - id: duration_validate
+    uses: narrative.duration_validate
+    needs: [narrative]
+    config:
+      words_per_minute: 155
+      tolerance_percent: 5
+      checkpoint_when_over_limit: true
+
+  - id: duration_review
+    uses: human.duration_approval
+    needs: [duration_validate]
+    checkpoint: human
+
+  - id: speech
+    uses: speech.synthesize
+    needs: [duration_review]
+    config:
+      provider: vertex_ai
+      model: gemini-3.1-flash-tts-preview
+      location: global
+      voice: Kore
+      language_code: pt-BR
+      style_prompt: Narração profissional, natural, clara e envolvente.
+      max_retries: 2
+      rate: 155
+      timeout_seconds: 180
+      debug:
+        provider: espeak
+        voice: pt-br
+    retry:
+      attempts: 3
+      backoff_seconds: 2
+
+  - id: scene_plan
+    uses: scenes.plan
+    needs: [narrative, speech]
+    config:
+      maximum_shot_seconds: 8
+      timeline_source: aligned_audio
+      informational_scenes:
+        preserve_as_static: true
+        maximum_takes: 1
+
+  - id: visual_plan
+    uses: visuals.direct
+    needs: [scene_plan]
+    config:
+      provider: pydantic_ai
+      model: google-cloud:gemini-3.5-flash
+      location: global
+    retry:
+      attempts: 3
+      backoff_seconds: 1
+
+  - id: prompt_compile
+    uses: prompts.compile
+    needs: [visual_plan]
+    config:
+      continuity: locked
+      forbid_source_slides_in_cinematic_mode: true
+      allow_informational_static_exception: false
+
+  - id: rule_validate
+    uses: rules.validate
+    needs: [prompt_compile]
+    config:
+      maximum_shot_seconds: 8
+      require_complete_audio_coverage: true
+
+  - id: generate_images
+    uses: assets.generate
+    needs: [rule_validate]
+    parallelism: 3
+    config:
+      provider: vertex_ai
+      model: gemini-3.1-flash-image
+      location: global
+      aspect_ratio: "16:9"
+      image_size: 2K
+      timeout_seconds: 180
+    retry:
+      attempts: 4
+      backoff_seconds: 2
+
+  - id: visual_review
+    uses: human.approval
+    needs: [generate_images]
+    checkpoint: human
+
+  - id: animate
+    uses: videos.generate
+    needs: [visual_review]
+    parallelism: 2
+    config:
+      provider: vertex_ai
+      model: veo-3.1-fast-generate-001
+      location: us-central1
+      aspect_ratio: "16:9"
+      resolution: 720p
+      duration_seconds: 8
+      poll_interval_seconds: 5
+      timeout_seconds: 900
+    retry:
+      attempts: 3
+      backoff_seconds: 2
+
+  - id: visual_qa
+    uses: visuals.qa
+    needs: [animate]
+    config:
+      verify_duration: true
+      verify_non_empty_media: true
+      retry_scope: shot
+
+  - id: render
+    uses: video.compose_scenes
+    needs: [speech, visual_qa]
+    parallelism: 2
+
+  - id: assemble
+    uses: video.compose_final
+    needs: [render]
+
+  - id: captions
+    uses: captions.package
+    needs: [assemble]
+    config:
+      formats: [webvtt, srt]
+      burn_in: false

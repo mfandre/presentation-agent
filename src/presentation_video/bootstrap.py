@@ -48,6 +48,9 @@ from presentation_video.infrastructure.visual_planning import (
     ReplicateVisualPlanner,
 )
 from presentation_video.settings import Settings
+from presentation_video.workflow.config import StepRuntimeConfig, WorkflowRuntimeConfig
+from presentation_video.workflow.loader import WorkflowLoader
+from presentation_video.workflow.models import WorkflowDefinition
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +61,7 @@ def _require_google_cloud_project(settings: Settings, context: str) -> str:
     return settings.google_cloud_project
 
 
-def _pydantic_ai_model(model_name: str, settings: Settings) -> Any:
+def _pydantic_ai_model(model_name: str, settings: Settings, location: str = "global") -> Any:
     """Resolve google-cloud models explicitly so ADC never falls back to an API key."""
 
     prefix = "google-cloud:"
@@ -69,7 +72,7 @@ def _pydantic_ai_model(model_name: str, settings: Settings) -> Any:
         raise ValueError("A model name is required after the 'google-cloud:' prefix")
     provider = GoogleCloudProvider(
         project=_require_google_cloud_project(settings, "Pydantic AI with Vertex AI"),
-        location=settings.vertex_text_location,
+        location=location,
     )
     return GoogleModel(vertex_model_name, provider=provider)
 
@@ -77,9 +80,36 @@ def _pydantic_ai_model(model_name: str, settings: Settings) -> Any:
 def build_pipeline(
     settings: Settings | None = None,
     reporter: JobReporter | None = None,
+    workflow: WorkflowDefinition | None = None,
 ) -> CreatePresentationVideo:
     settings = settings or Settings()
+    workflow = workflow or WorkflowLoader(settings.workflow_root).load(settings.default_workflow)
+    runtime = WorkflowRuntimeConfig(workflow)
+    narrative_config = runtime.step("narrative")
+    planner_config = runtime.step("visual_plan")
+    image_config = runtime.step("generate_images")
+    speech_config = runtime.step("speech")
+    video_config = runtime.step("animate")
+    scene_plan_config = runtime.raw("scene_plan")
+    duration_config = runtime.raw("duration_validate")
+    allow_duration_review = bool(duration_config.get("checkpoint_when_over_limit", True))
+    maximum_shot_seconds = float(scene_plan_config.get("maximum_shot_seconds", 8))
+
+    def replicate_client(config: StepRuntimeConfig) -> ReplicatePredictionClient:
+        secret_name = config.secrets.get("api_token")
+        if not secret_name:
+            raise ValueError(
+                "Replicate steps must declare config.secrets.api_token"
+            )
+        return ReplicatePredictionClient(
+            settings.secret(secret_name) or "",
+            config.poll_interval_seconds,
+            config.timeout_seconds,
+        )
+
     if settings.debug_mode:
+        narrative_debug = runtime.raw("narrative").get("debug", {})
+        speech_debug = runtime.raw("speech").get("debug", {})
         logger.warning(
             "DEBUG_MODE enabled: all external AI providers are bypassed; "
             "using deterministic narrative/planning, source-page images, local eSpeak and FFmpeg"
@@ -87,15 +117,15 @@ def build_pipeline(
         return CreatePresentationVideo(
             ingestor_factory=ExtensionDocumentIngestorFactory(),
             narrative_generator=DebugNarrativeGenerator(
-                max_scenes=settings.debug_max_scenes,
-                words_per_minute=settings.words_per_minute,
+                max_scenes=int(narrative_debug.get("max_scenes", 3)),
+                words_per_minute=int(runtime.raw("narrative").get("words_per_minute", 155)),
             ),
             visual_planner=DebugVisualPlanner(),
             visual_asset_generator=SlideVisualAssetGenerator(),
             video_clip_generator=FfmpegImageAnimator(),
             speech_synthesizer=EspeakSpeechSynthesizer(
-                voice=settings.debug_tts_voice,
-                rate=settings.tts_rate,
+                voice=str(speech_debug.get("voice", "pt-br")),
+                rate=int(runtime.raw("speech").get("rate", 155)),
             ),
             avatar_renderer=NoAvatarRenderer(),
             scene_renderer=FfmpegSceneRenderer(),
@@ -103,170 +133,176 @@ def build_pipeline(
             reporter=reporter or LoggingJobReporter(),
             work_root=settings.work_root,
             output_root=settings.output_root,
-            max_parallel_scenes=settings.max_parallel_scenes,
+            max_parallel_scenes=runtime.parallelism(
+                "generate_images", "speech", "animate", "render"
+            ),
+            maximum_shot_seconds=maximum_shot_seconds,
+            duration_tolerance_percent=float(duration_config.get("tolerance_percent", 5)),
+            words_per_minute=int(duration_config.get("words_per_minute", 155)),
         )
-    if settings.visual_image_provider == "slide" and settings.visual_media_provider in {
+    if image_config.provider == "slide" and video_config.provider in {
         "replicate",
         "vertex_ai",
     }:
         raise ValueError(
-            "VISUAL_IMAGE_PROVIDER=slide cannot be combined with "
-            f"VISUAL_MEDIA_PROVIDER={settings.visual_media_provider} because source-page text "
+            "generate_images.provider=slide cannot be combined with "
+            f"animate.provider={video_config.provider} because source-page text "
             "would be sent to image-to-video. Use a generative image provider or "
-            "VISUAL_MEDIA_PROVIDER=ffmpeg."
-        )
-    replicate_client = None
-    if (
-        settings.narrative_provider == "replicate"
-        or settings.visual_planner_provider == "replicate"
-        or settings.visual_image_provider == "replicate"
-        or settings.visual_media_provider == "replicate"
-        or settings.tts_provider == "replicate"
-    ):
-        replicate_client = ReplicatePredictionClient(
-            settings.replicate_api_token or "",
-            settings.replicate_poll_interval_seconds,
-            settings.replicate_timeout_seconds,
+            "animate.provider=ffmpeg."
         )
 
     vertex_client_factory = None
     if (
-        settings.visual_image_provider == "vertex_ai"
-        or settings.visual_media_provider == "vertex_ai"
-        or settings.tts_provider == "vertex_ai"
+        image_config.provider == "vertex_ai"
+        or video_config.provider == "vertex_ai"
+        or speech_config.provider == "vertex_ai"
     ):
         vertex_client_factory = VertexClientFactory(
             _require_google_cloud_project(settings, "Vertex AI providers")
         )
 
     narrative_generator: NarrativeGenerator
-    if settings.narrative_provider == "pydantic_ai":
+    if narrative_config.provider == "pydantic_ai":
         narrative_generator = PydanticAINarrativeGenerator(
-            _pydantic_ai_model(settings.llm_model, settings),
-            settings.narrative_max_revisions,
-            settings.words_per_minute,
+            _pydantic_ai_model(
+                narrative_config.model or "",
+                settings,
+                str(runtime.raw("narrative").get("location", "global")),
+            ),
+            int(runtime.raw("narrative").get("max_revisions", 2)),
+            int(runtime.raw("narrative").get("words_per_minute", 155)),
+            allow_duration_review,
         )
-    elif settings.narrative_provider == "replicate":
-        if not settings.replicate_narrative_model:
-            raise ValueError("REPLICATE_NARRATIVE_MODEL is required for Replicate narration")
-        assert replicate_client is not None
+    elif narrative_config.provider == "replicate":
+        if not narrative_config.model:
+            raise ValueError("narrative.model is required for Replicate narration")
         narrative_generator = ReplicateNarrativeGenerator(
-            replicate_client,
-            settings.replicate_narrative_model,
-            settings.replicate_narrative_input,
-            settings.narrative_max_revisions,
-            settings.words_per_minute,
+            replicate_client(narrative_config),
+            narrative_config.model,
+            narrative_config.model_input,
+            int(runtime.raw("narrative").get("max_revisions", 2)),
+            int(runtime.raw("narrative").get("words_per_minute", 155)),
+            allow_duration_review,
         )
     else:
-        raise ValueError("NARRATIVE_PROVIDER must be 'pydantic_ai' or 'replicate'")
+        raise ValueError("narrative.provider must be 'pydantic_ai' or 'replicate'")
 
     visual_planner: VisualPlanner
-    if settings.visual_planner_provider == "pydantic_ai":
+    if planner_config.provider == "pydantic_ai":
         visual_planner = PydanticAIVisualPlanner(
-            _pydantic_ai_model(settings.visual_planner_model, settings)
+            _pydantic_ai_model(
+                planner_config.model or "",
+                settings,
+                str(runtime.raw("visual_plan").get("location", "global")),
+            )
         )
-    elif settings.visual_planner_provider == "replicate":
-        if not settings.replicate_planner_model:
-            raise ValueError("REPLICATE_PLANNER_MODEL is required for the Replicate planner")
-        assert replicate_client is not None
+    elif planner_config.provider == "replicate":
+        if not planner_config.model:
+            raise ValueError("visual_plan.model is required for the Replicate planner")
         visual_planner = ReplicateVisualPlanner(
-            replicate_client, settings.replicate_planner_model, settings.replicate_planner_input
+            replicate_client(planner_config),
+            planner_config.model,
+            planner_config.model_input,
         )
     else:
-        raise ValueError("VISUAL_PLANNER_PROVIDER must be 'pydantic_ai' or 'replicate'")
+        raise ValueError("visual_plan.provider must be 'pydantic_ai' or 'replicate'")
 
     visual_asset_generator: VisualAssetGenerator
-    if settings.visual_image_provider == "slide":
+    if image_config.provider == "slide":
         visual_asset_generator = SlideVisualAssetGenerator()
-    elif settings.visual_image_provider == "replicate":
-        if not settings.replicate_image_model:
-            raise ValueError("REPLICATE_IMAGE_MODEL is required for Replicate image generation")
-        assert replicate_client is not None
+    elif image_config.provider == "replicate":
+        if not image_config.model:
+            raise ValueError("generate_images.model is required for Replicate image generation")
         visual_asset_generator = ReplicateImageAssetGenerator(
-            replicate_client, settings.replicate_image_model, settings.replicate_image_input
+            replicate_client(image_config),
+            image_config.model,
+            image_config.model_input,
         )
-    elif settings.visual_image_provider == "vertex_ai":
+    elif image_config.provider == "vertex_ai":
         assert vertex_client_factory is not None
         visual_asset_generator = VertexImageAssetGenerator(
-            vertex_client_factory.client(settings.vertex_image_location),
-            model=settings.vertex_image_model,
-            aspect_ratio=settings.vertex_image_aspect_ratio,
-            image_size=settings.vertex_image_size,
-            timeout_seconds=settings.vertex_image_timeout_seconds,
+            vertex_client_factory.client(
+                str(runtime.raw("generate_images").get("location", "global"))
+            ),
+            model=image_config.model or "gemini-3.1-flash-image",
+            aspect_ratio=str(runtime.raw("generate_images").get("aspect_ratio", "16:9")),
+            image_size=str(runtime.raw("generate_images").get("image_size", "2K")),
+            timeout_seconds=image_config.timeout_seconds,
         )
     else:
-        raise ValueError("VISUAL_IMAGE_PROVIDER must be 'slide', 'replicate', or 'vertex_ai'")
+        raise ValueError("generate_images.provider must be 'slide', 'replicate', or 'vertex_ai'")
 
     video_clip_generator: VideoClipGenerator
-    if settings.visual_media_provider == "ffmpeg":
+    if video_config.provider == "ffmpeg":
         video_clip_generator = FfmpegImageAnimator()
-    elif settings.visual_media_provider == "replicate":
-        if not settings.replicate_video_model:
-            raise ValueError("REPLICATE_VIDEO_MODEL is required for Replicate video generation")
-        assert replicate_client is not None
+    elif video_config.provider == "replicate":
+        if not video_config.model:
+            raise ValueError("animate.model is required for Replicate video generation")
         video_clip_generator = ReplicateVideoAssetGenerator(
-            replicate_client,
-            settings.replicate_video_model,
-            settings.replicate_video_image_input_key,
-            settings.replicate_video_input,
+            replicate_client(video_config),
+            video_config.model,
+            str(runtime.raw("animate").get("image_input_key", "image")),
+            video_config.model_input,
         )
-    elif settings.visual_media_provider == "vertex_ai":
+    elif video_config.provider == "vertex_ai":
         assert vertex_client_factory is not None
         video_clip_generator = VertexVideoAssetGenerator(
-            vertex_client_factory.client(settings.vertex_video_location),
+            vertex_client_factory.client(
+                str(runtime.raw("animate").get("location", "us-central1"))
+            ),
             settings.vertex_video_output_gcs_uri,
-            model=settings.vertex_video_model,
-            aspect_ratio=settings.vertex_video_aspect_ratio,
-            resolution=settings.vertex_video_resolution,
-            clip_duration_seconds=settings.vertex_video_duration_seconds,
-            poll_interval_seconds=settings.vertex_video_poll_interval_seconds,
-            timeout_seconds=settings.vertex_video_timeout_seconds,
+            model=video_config.model or "veo-3.1-fast-generate-001",
+            aspect_ratio=str(runtime.raw("animate").get("aspect_ratio", "16:9")),
+            resolution=str(runtime.raw("animate").get("resolution", "720p")),
+            clip_duration_seconds=int(runtime.raw("animate").get("duration_seconds", 8)),
+            poll_interval_seconds=video_config.poll_interval_seconds,
+            timeout_seconds=video_config.timeout_seconds,
         )
     else:
-        raise ValueError("VISUAL_MEDIA_PROVIDER must be 'ffmpeg', 'replicate', or 'vertex_ai'")
+        raise ValueError("animate.provider must be 'ffmpeg', 'replicate', or 'vertex_ai'")
 
     speech_synthesizer: SpeechSynthesizer
-    if settings.tts_provider == "pydantic_ai":
+    speech_raw = runtime.raw("speech")
+    if speech_config.provider == "pydantic_ai":
         speech_synthesizer = PydanticAIGoogleTTSSynthesizer(
-            model=settings.tts_model,
-            voice=settings.tts_voice,
-            language_code=settings.tts_language_code,
-            style_prompt=settings.tts_prompt,
-            max_retries=settings.tts_max_retries,
+            model=speech_config.model or "",
+            voice=str(speech_raw.get("voice", "Kore")),
+            language_code=str(speech_raw.get("language_code", "pt-BR")),
+            style_prompt=str(speech_raw.get("style_prompt", "")),
+            max_retries=int(speech_raw.get("max_retries", 2)),
             api_key=settings.google_api_key,
         )
-    elif settings.tts_provider == "replicate":
-        if not settings.replicate_tts_model:
-            raise ValueError("REPLICATE_TTS_MODEL is required for Replicate TTS")
-        assert replicate_client is not None
+    elif speech_config.provider == "replicate":
+        if not speech_config.model:
+            raise ValueError("speech.model is required for Replicate TTS")
         speech_synthesizer = ReplicateTTSSynthesizer(
-            replicate_client,
-            settings.replicate_tts_model,
-            settings.replicate_tts_input,
-            voice=settings.tts_voice,
-            language_code=settings.tts_language_code,
-            style_prompt=settings.tts_prompt,
-            max_retries=settings.tts_max_retries,
+            replicate_client(speech_config),
+            speech_config.model,
+            speech_config.model_input,
+            voice=str(speech_raw.get("voice", "Kore")),
+            language_code=str(speech_raw.get("language_code", "pt-BR")),
+            style_prompt=str(speech_raw.get("style_prompt", "")),
+            max_retries=int(speech_raw.get("max_retries", 2)),
         )
-    elif settings.tts_provider == "espeak":
+    elif speech_config.provider == "espeak":
         speech_synthesizer = EspeakSpeechSynthesizer(
-            voice=settings.tts_voice,
-            rate=settings.tts_rate,
+            voice=str(speech_raw.get("voice", "pt-br")),
+            rate=int(speech_raw.get("rate", 155)),
         )
-    elif settings.tts_provider == "vertex_ai":
+    elif speech_config.provider == "vertex_ai":
         assert vertex_client_factory is not None
         speech_synthesizer = VertexSpeechSynthesizer(
-            vertex_client_factory.client(settings.vertex_tts_location),
-            model=settings.tts_model.removeprefix("google-cloud:"),
-            voice=settings.tts_voice,
-            language_code=settings.tts_language_code,
-            style_prompt=settings.tts_prompt,
-            max_retries=settings.tts_max_retries,
-            timeout_seconds=settings.vertex_tts_timeout_seconds,
+            vertex_client_factory.client(str(speech_raw.get("location", "global"))),
+            model=(speech_config.model or "").removeprefix("google-cloud:"),
+            voice=str(speech_raw.get("voice", "Kore")),
+            language_code=str(speech_raw.get("language_code", "pt-BR")),
+            style_prompt=str(speech_raw.get("style_prompt", "")),
+            max_retries=int(speech_raw.get("max_retries", 2)),
+            timeout_seconds=speech_config.timeout_seconds,
         )
     else:
         raise ValueError(
-            "TTS_PROVIDER must be 'pydantic_ai', 'replicate', 'vertex_ai', or 'espeak'"
+            "speech.provider must be 'pydantic_ai', 'replicate', 'vertex_ai', or 'espeak'"
         )
 
     return CreatePresentationVideo(
@@ -282,5 +318,8 @@ def build_pipeline(
         reporter=reporter or LoggingJobReporter(),
         work_root=settings.work_root,
         output_root=settings.output_root,
-        max_parallel_scenes=settings.max_parallel_scenes,
+        max_parallel_scenes=runtime.parallelism("generate_images", "speech", "animate", "render"),
+        maximum_shot_seconds=maximum_shot_seconds,
+        duration_tolerance_percent=float(duration_config.get("tolerance_percent", 5)),
+        words_per_minute=int(duration_config.get("words_per_minute", 155)),
     )

@@ -8,55 +8,34 @@ from pydantic import ValidationError
 
 import presentation_video.bootstrap as bootstrap
 from presentation_video.settings import Settings
+from presentation_video.workflow.loader import WorkflowLoader
+from presentation_video.workflow.models import WorkflowDefinition
 
 
 def _settings(**overrides: Any) -> Settings:
-    values: dict[str, Any] = {
-        "_env_file": None,
-        "narrative_provider": "pydantic_ai",
-        "llm_model": "openai:gpt-5.2",
-        "visual_planner_provider": "pydantic_ai",
-        "visual_planner_model": "openai:gpt-5.2",
-        "visual_image_provider": "slide",
-        "visual_media_provider": "ffmpeg",
-        "tts_provider": "espeak",
-    }
+    values: dict[str, Any] = {"_env_file": None}
     values.update(overrides)
     return Settings(**values)
 
 
-def test_vertex_settings_have_service_specific_models_regions_and_timeouts() -> None:
-    settings = Settings(_env_file=None)
-
-    assert settings.vertex_text_location == "global"
-    assert settings.vertex_image_model == "gemini-3.1-flash-image"
-    assert settings.vertex_image_location == "global"
-    assert settings.vertex_image_aspect_ratio == "16:9"
-    assert settings.vertex_image_size == "2K"
-    assert settings.vertex_image_timeout_seconds == 180
-    assert settings.vertex_video_model == "veo-3.1-fast-generate-001"
-    assert settings.vertex_video_location == "us-central1"
-    assert settings.vertex_video_aspect_ratio == "16:9"
-    assert settings.vertex_video_resolution == "720p"
-    assert settings.vertex_video_duration_seconds == 8
-    assert settings.vertex_video_poll_interval_seconds == 5
-    assert settings.vertex_video_timeout_seconds == 900
-    assert settings.vertex_tts_location == "global"
-    assert settings.vertex_tts_timeout_seconds == 180
+def _workflow() -> WorkflowDefinition:
+    workflow = WorkflowLoader(Path("workflows")).load("presentation-video")
+    configs = {step.id: step.config for step in workflow.steps}
+    configs["narrative"].update({"provider": "pydantic_ai", "model": "openai:gpt-5.2"})
+    configs["visual_plan"].update({"provider": "pydantic_ai", "model": "openai:gpt-5.2"})
+    configs["generate_images"].update({"provider": "slide", "model": None})
+    configs["animate"].update({"provider": "ffmpeg", "model": None})
+    configs["speech"].update({"provider": "espeak", "model": None})
+    return workflow
 
 
-def test_google_only_env_example_is_loadable() -> None:
+def test_google_only_env_example_contains_infrastructure_only() -> None:
     env_file = Path(__file__).parents[1] / ".env.vertex-google-only.example"
 
     settings = Settings(_env_file=env_file)
 
-    assert settings.llm_model == "google-cloud:gemini-3.5-flash"
-    assert settings.visual_planner_model == "google-cloud:gemini-3.5-flash"
-    assert settings.visual_image_provider == "vertex_ai"
-    assert settings.visual_media_provider == "vertex_ai"
+    assert settings.google_cloud_project == "meu-projeto-gcp"
     assert settings.vertex_video_output_gcs_uri is None
-    assert settings.vertex_video_duration_seconds == 8
-    assert settings.tts_provider == "vertex_ai"
 
 
 def test_vertex_gcs_uri_is_normalized_and_validated() -> None:
@@ -99,9 +78,9 @@ def test_google_cloud_model_uses_explicit_project_and_text_region(
         "google-cloud:gemini-3.5-flash",
         _settings(
             google_cloud_project="video-project",
-            vertex_text_location="southamerica-east1",
             google_api_key="must-not-be-used",
         ),
+        "southamerica-east1",
     )
 
     assert result is model
@@ -172,26 +151,44 @@ def test_bootstrap_wires_vertex_clients_by_service_region(
         constructor("speech", speech),
     )
 
+    workflow = _workflow()
+    configs = {step.id: step.config for step in workflow.steps}
+    configs["generate_images"].update(
+        {
+            "provider": "vertex_ai",
+            "model": "gemini-3.1-flash-image",
+            "location": "global",
+            "aspect_ratio": "16:9",
+            "image_size": "4K",
+            "timeout_seconds": 240,
+        }
+    )
+    configs["animate"].update(
+        {
+            "provider": "vertex_ai",
+            "model": "veo-3.1-fast-generate-001",
+            "location": "us-central1",
+            "aspect_ratio": "16:9",
+            "resolution": "1080p",
+            "duration_seconds": 6,
+            "poll_interval_seconds": 3,
+            "timeout_seconds": 1200,
+        }
+    )
+    configs["speech"].update(
+        {
+            "provider": "vertex_ai",
+            "model": "google-cloud:gemini-3.1-flash-tts-preview",
+            "location": "global",
+            "timeout_seconds": 240,
+        }
+    )
     pipeline = bootstrap.build_pipeline(
         _settings(
             google_cloud_project="video-project",
-            visual_image_provider="vertex_ai",
-            visual_media_provider="vertex_ai",
-            tts_provider="vertex_ai",
-            tts_model="google-cloud:gemini-3.1-flash-tts-preview",
-            vertex_image_location="global",
-            vertex_video_location="us-central1",
             vertex_video_output_gcs_uri="gs://video-bucket/jobs",
-            vertex_tts_location="global",
-            vertex_image_aspect_ratio="16:9",
-            vertex_image_size="4K",
-            vertex_image_timeout_seconds=240,
-            vertex_video_resolution="1080p",
-            vertex_video_duration_seconds=6,
-            vertex_video_poll_interval_seconds=3,
-            vertex_video_timeout_seconds=1200,
-            vertex_tts_timeout_seconds=240,
-        )
+        ),
+        workflow=workflow,
     )
 
     assert calls["project"] == "video-project"
@@ -253,13 +250,16 @@ def test_vertex_video_allows_inline_output_without_gcs_uri(
         lambda *args, **kwargs: object(),
     )
 
+    workflow = _workflow()
+    configs = {step.id: step.config for step in workflow.steps}
+    configs["generate_images"].update({"provider": "vertex_ai", "model": "gemini-3.1-flash-image"})
+    configs["animate"].update({"provider": "vertex_ai", "model": "veo-3.1-fast-generate-001"})
     pipeline = bootstrap.build_pipeline(
         _settings(
             google_cloud_project="video-project",
-            visual_image_provider="vertex_ai",
-            visual_media_provider="vertex_ai",
             vertex_video_output_gcs_uri=None,
-        )
+        ),
+        workflow=workflow,
     )
 
     assert isinstance(pipeline._video_clip_generator, bootstrap.VertexVideoAssetGenerator)

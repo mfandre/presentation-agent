@@ -105,9 +105,7 @@ async def test_narrative_accepts_small_final_word_budget_variance() -> None:
         cast(ReplicatePredictionClient, fake), "owner/model", max_revisions=0
     )
 
-    result = await generator.generate(
-        _document(), 30, "pt-BR", "executive", "professional"
-    )
+    result = await generator.generate(_document(), 30, "pt-BR", "executive", "professional")
 
     assert len(fake.prompts) == 1
     assert sum(len(scene.narration.split()) for scene in result.scenes) == 80
@@ -129,6 +127,28 @@ async def test_replicate_narrative_compacts_final_word_budget_overflow() -> None
 
     assert sum(len(scene.narration.split()) for scene in result.scenes) <= 155
     assert result.total_estimated_seconds == 60
+
+
+@pytest.mark.asyncio
+async def test_replicate_narrative_preserves_overflow_for_duration_checkpoint() -> None:
+    narration = " ".join(["palavra"] * 191)
+    too_long = {
+        "title": "Presentation",
+        "scenes": [_scene(1, narration), _scene(2, "Síntese")],
+    }
+    fake = FakeReplicateClient([too_long])
+    generator = ReplicateNarrativeGenerator(
+        cast(ReplicatePredictionClient, fake),
+        "owner/model",
+        max_revisions=2,
+        allow_duration_review=True,
+    )
+
+    result = await generator.generate(_document(), 60, "pt-BR", "executive", "professional")
+
+    assert sum(len(scene.narration.split()) for scene in result.scenes) == 192
+    assert result.total_estimated_seconds == 75
+    assert len(fake.prompts) == 1
 
 
 @pytest.mark.asyncio

@@ -20,25 +20,38 @@ interface ProcessingPanelProps {
 const STEPS: Array<{ status: JobStatus; label: string; description: string; icon: typeof FileScan }> = [
   { status: "ingesting", label: "Lendo o documento", description: "Extração de páginas, conteúdo e imagens", icon: FileScan },
   { status: "scripting", label: "Criando a narrativa", description: "Síntese do conteúdo em um arco de storytelling", icon: Sparkles },
-  { status: "visual_planning", label: "Planejando as cenas", description: "Direção visual coerente com a narrativa", icon: Sparkles },
-  { status: "generating_images", label: "Gerando as imagens", description: "Criação dos frames-base para revisão", icon: Sparkles },
+  { status: "duration_validating", label: "Validando a duração", description: "Comparação entre tempo solicitado e narração planejada", icon: AudioLines },
   { status: "synthesizing", label: "Gerando a voz", description: "Síntese do áudio por cena", icon: AudioLines },
+  { status: "scene_planning", label: "Planejando cenas e takes", description: "Timeline aderente ao áudio, com takes de até 8 segundos", icon: Clapperboard },
+  { status: "visual_planning", label: "Dirigindo os visuais", description: "Classificação entre conteúdo animável e informacional estático", icon: Sparkles },
+  { status: "prompt_compiling", label: "Compilando prompts", description: "Continuidade e instruções específicas para cada take", icon: Sparkles },
+  { status: "rule_validating", label: "Validando as regras", description: "Cobertura do áudio, duração e restrições de mídia", icon: FileScan },
+  { status: "generating_images", label: "Gerando as imagens", description: "Criação dos frames-base para revisão", icon: Sparkles },
   { status: "generating_video", label: "Criando os clipes", description: "Movimento apenas nas cenas sem texto; slides permanecem fixos", icon: Clapperboard },
+  { status: "visual_qa", label: "Validando os clipes", description: "Verificação dos artefatos antes da composição", icon: FileScan },
   { status: "rendering", label: "Renderizando as cenas", description: "Composição dos visuais e do áudio", icon: Clapperboard },
   { status: "assembling", label: "Finalizando o vídeo", description: "Montagem e exportação em MP4", icon: FileText },
+  { status: "captioning", label: "Gerando legendas", description: "Exportação dos arquivos WebVTT e SRT", icon: FileText },
 ];
 
 const ORDER: JobStatus[] = [
   "received",
   "ingesting",
   "scripting",
+  "duration_validating",
+  "awaiting_duration_approval",
+  "synthesizing",
+  "scene_planning",
   "visual_planning",
+  "prompt_compiling",
+  "rule_validating",
   "generating_images",
   "awaiting_visual_approval",
-  "synthesizing",
   "generating_video",
+  "visual_qa",
   "rendering",
   "assembling",
+  "captioning",
   "completed",
 ];
 
@@ -113,6 +126,11 @@ export function ProcessingPanel({ job, error }: ProcessingPanelProps) {
       <div className="processing-meta">
         <span>Job <code>{job.job_id.slice(0, 8)}</code></span>
         <span>Meta: {Math.round(job.target_seconds / 60)} min</span>
+        <span>
+          Formato: {job.production_mode === "cinematic_story"
+            ? "história cinematográfica"
+            : "apresentação híbrida"}
+        </span>
       </div>
     </div>
   );

@@ -5,7 +5,12 @@ import logging
 import mimetypes
 from pathlib import Path
 
-from presentation_video.domain.models import MediaMode, SlideContent, VisualArtifact, VisualScenePlan
+from presentation_video.domain.models import (
+    MediaMode,
+    SlideContent,
+    VisualArtifact,
+    VisualScenePlan,
+)
 from presentation_video.infrastructure.process import run_process
 from presentation_video.infrastructure.replicate import ReplicatePredictionClient
 from presentation_video.infrastructure.concept_grounding import (
@@ -14,6 +19,12 @@ from presentation_video.infrastructure.concept_grounding import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _artifact_stem(scene_number: int, shot_number: int) -> str:
+    base = f"scene-{scene_number:03d}"
+    return base if shot_number == 1 else f"{base}-shot-{shot_number:03d}"
+
 
 _SAFE_VISUAL_POLICY = (
     "Safety and fidelity constraints: depict routine, calm, lawful professional activity only. "
@@ -59,9 +70,7 @@ def _visual_prompt(plan: VisualScenePlan, source_slides: list[SlideContent] | No
             f"Concrete visible evidence required: {'; '.join(plan.visible_evidence)}. "
         )
     if plan.forbidden_substitutions:
-        narrative_contract += (
-            f"Do not substitute with: {'; '.join(plan.forbidden_substitutions)}. "
-        )
+        narrative_contract += f"Do not substitute with: {'; '.join(plan.forbidden_substitutions)}. "
     return (
         "Create a grounded, plausible real-world image that can become a short moving shot. "
         "This is one precise documentary beat, not a montage or a summary of the narration. "
@@ -107,6 +116,7 @@ class SlideVisualAssetGenerator:
         source_slide = source_slides[0]
         return VisualArtifact(
             scene_number=plan.scene_number,
+            shot_number=plan.shot_number,
             path=source_slide.image_path,
             kind="image",
             revision=revision,
@@ -141,12 +151,15 @@ class ReplicateImageAssetGenerator:
         suffix = Path(url.split("?", 1)[0]).suffix.lower()
         if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
             suffix = ".webp"
-        destination = output_dir / f"scene-{plan.scene_number:03d}-r{revision}{suffix}"
+        destination = output_dir / (
+            f"{_artifact_stem(plan.scene_number, plan.shot_number)}-r{revision}{suffix}"
+        )
         await self._client.download(url, destination)
         if not destination.exists() or destination.stat().st_size == 0:
             raise RuntimeError(f"Replicate returned an empty image for scene {plan.scene_number}")
         return VisualArtifact(
             scene_number=plan.scene_number,
+            shot_number=plan.shot_number,
             path=destination,
             kind="image",
             revision=revision,
@@ -184,7 +197,9 @@ class ReplicateVideoAssetGenerator:
             "1:1": (1024, 1024),
         }.get(str(self._input_defaults.get("aspect_ratio", "")))
         if target_dimensions is not None or input_path.stat().st_size > 900_000:
-            compressed = output_dir / f"scene-{image.scene_number:03d}-input.jpg"
+            compressed = output_dir / (
+                f"{_artifact_stem(image.scene_number, image.shot_number)}-input.jpg"
+            )
             compressed.parent.mkdir(parents=True, exist_ok=True)
             if target_dimensions is not None:
                 width, height = target_dimensions
@@ -245,12 +260,15 @@ class ReplicateVideoAssetGenerator:
         suffix = Path(url.split("?", 1)[0]).suffix.lower()
         if suffix not in {".mp4", ".webm", ".mov"}:
             suffix = ".mp4"
-        destination = output_dir / f"scene-{image.scene_number:03d}{suffix}"
+        destination = output_dir / (
+            f"{_artifact_stem(image.scene_number, image.shot_number)}{suffix}"
+        )
         await self._client.download(url, destination)
         if not destination.exists() or destination.stat().st_size == 0:
             raise RuntimeError(f"Replicate returned an empty video for scene {image.scene_number}")
         return VisualArtifact(
             scene_number=image.scene_number,
+            shot_number=image.shot_number,
             path=destination,
             kind="video",
             revision=image.revision,
@@ -306,7 +324,7 @@ class FfmpegImageAnimator:
         if plan.media_mode != MediaMode.VIDEO:
             raise ValueError("Static scenes must bypass local image animation")
         output_dir.mkdir(parents=True, exist_ok=True)
-        destination = output_dir / f"scene-{image.scene_number:03d}.mp4"
+        destination = output_dir / (f"{_artifact_stem(image.scene_number, image.shot_number)}.mp4")
         cycle_duration = min(max(duration_seconds, 5.0), 8.0)
         frame_count = max(round(cycle_duration * 30), 1)
         motion_filter = _local_motion_filter(plan.motion_preset.value, frame_count)
@@ -331,6 +349,7 @@ class FfmpegImageAnimator:
         )
         return VisualArtifact(
             scene_number=image.scene_number,
+            shot_number=image.shot_number,
             path=destination,
             kind="video",
             revision=image.revision,
@@ -345,26 +364,12 @@ def _local_motion_filter(preset: str, frame_count: int) -> str:
             + progress
             + ")':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
         ),
-        "pan_left": (
-            "zoompan=z='1.06':x='(iw-iw/zoom)*(1-"
-            + progress
-            + ")':y='ih/2-(ih/zoom/2)'"
-        ),
-        "pan_right": (
-            "zoompan=z='1.06':x='(iw-iw/zoom)*"
-            + progress
-            + "':y='ih/2-(ih/zoom/2)'"
-        ),
-        "drift_up": (
-            "zoompan=z='1.05':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-"
-            + progress
-            + ")'"
-        ),
+        "pan_left": ("zoompan=z='1.06':x='(iw-iw/zoom)*(1-" + progress + ")':y='ih/2-(ih/zoom/2)'"),
+        "pan_right": ("zoompan=z='1.06':x='(iw-iw/zoom)*" + progress + "':y='ih/2-(ih/zoom/2)'"),
+        "drift_up": ("zoompan=z='1.05':x='iw/2-(iw/zoom/2)':y='(ih-ih/zoom)*(1-" + progress + ")'"),
         "none": "zoompan=z='1.0':x='0':y='0'",
     }
     return filters.get(
         preset,
-        "zoompan=z='min(1.08,1.0+0.08*"
-        + progress
-        + ")':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+        "zoompan=z='min(1.08,1.0+0.08*" + progress + ")':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
     )

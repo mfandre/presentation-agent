@@ -1,0 +1,207 @@
+id: presentation-video
+version: 2.4.0
+description: Produção de vídeo narrado com revisão humana dos visuais.
+
+inputs:
+  source_path:
+    type: file
+    required: true
+  target_seconds:
+    type: integer
+    default: 600
+  language:
+    type: string
+    default: pt-BR
+  audience:
+    type: string
+    default: executive
+  tone:
+    type: string
+    default: professional and natural
+  production_mode:
+    type: string
+    default: hybrid_presentation
+
+settings:
+  state_backend: sqlite
+  artifacts: external_storage
+
+steps:
+  - id: ingest
+    uses: document.ingest
+    outputs:
+      document: presentation_document
+
+  - id: narrative
+    uses: narrative.plan
+    needs: [ingest]
+    config:
+      provider: replicate
+      model: openai/gpt-5.6-terra
+      secrets:
+        api_token: REPLICATE_API_TOKEN
+      model_input:
+        max_tokens: 8192
+        temperature: 0.2
+      max_revisions: 2
+      words_per_minute: 155
+      debug:
+        max_scenes: 3
+    retry:
+      attempts: 3
+      backoff_seconds: 1
+
+  - id: duration_validate
+    uses: narrative.duration_validate
+    needs: [narrative]
+    config:
+      words_per_minute: 155
+      tolerance_percent: 5
+      checkpoint_when_over_limit: true
+
+  - id: duration_review
+    uses: human.duration_approval
+    needs: [duration_validate]
+    checkpoint: human
+
+  - id: speech
+    uses: speech.align
+    needs: [duration_review]
+    parallelism: 1
+    config:
+      provider: replicate
+      model: google/gemini-3.1-flash-tts
+      secrets:
+        api_token: REPLICATE_API_TOKEN
+      model_input: {}
+      voice: Kore
+      language_code: pt-BR
+      style_prompt: Narração profissional, natural, clara e envolvente.
+      max_retries: 2
+      rate: 155
+      debug:
+        provider: espeak
+        voice: pt-br
+    retry:
+      attempts: 3
+      backoff_seconds: 2
+
+  - id: scene_plan
+    uses: scenes.plan
+    needs: [narrative, speech]
+    config:
+      maximum_shot_seconds: 8
+      timeline_source: aligned_audio
+      informational_scenes:
+        preserve_as_static: true
+        maximum_takes: 1
+        signals:
+          - readable_text
+          - tables
+          - exact_numbers
+          - deadlines
+          - process_flow
+          - approval_matrix
+
+  - id: visual_plan
+    uses: visuals.direct
+    needs: [scene_plan]
+    config:
+      provider: replicate
+      model: openai/gpt-5.6-luna
+      secrets:
+        api_token: REPLICATE_API_TOKEN
+      model_input:
+        max_tokens: 8192
+        temperature: 0.3
+    retry:
+      attempts: 3
+      backoff_seconds: 1
+
+  - id: prompt_compile
+    uses: prompts.compile
+    needs: [visual_plan]
+    config:
+      continuity: locked
+      forbid_source_slides_in_cinematic_mode: true
+      allow_informational_static_exception: false
+
+  - id: rule_validate
+    uses: rules.validate
+    needs: [prompt_compile]
+    config:
+      maximum_shot_seconds: 8
+      require_complete_audio_coverage: true
+      reject_timeline_gaps: true
+
+  - id: generate_images
+    uses: assets.generate
+    needs: [rule_validate]
+    parallelism: 3
+    config:
+      provider: replicate
+      model: openai/gpt-image-2
+      secrets:
+        api_token: REPLICATE_API_TOKEN
+      model_input:
+        aspect_ratio: 1536x1024
+        quality: auto
+        background: opaque
+        moderation: auto
+        output_format: jpeg
+        number_of_images: 1
+        output_compression: 90
+      poll_interval_seconds: 2
+      timeout_seconds: 900
+    retry:
+      attempts: 4
+      backoff_seconds: 2
+
+  - id: visual_review
+    uses: human.approval
+    needs: [generate_images]
+    checkpoint: human
+
+  - id: animate
+    uses: videos.generate
+    needs: [visual_review]
+    parallelism: 1
+    config:
+      provider: replicate
+      model: google/veo-3.1-lite
+      secrets:
+        api_token: REPLICATE_API_TOKEN
+      image_input_key: image
+      model_input:
+        aspect_ratio: "16:9"
+        duration: 8
+        resolution: 1080p
+      poll_interval_seconds: 2
+      timeout_seconds: 900
+    retry:
+      attempts: 3
+      backoff_seconds: 2
+
+  - id: visual_qa
+    uses: visuals.qa
+    needs: [animate]
+    config:
+      verify_duration: true
+      verify_non_empty_media: true
+      retry_scope: shot
+
+  - id: render
+    uses: video.compose_scenes
+    needs: [visual_qa, speech]
+    parallelism: 2
+
+  - id: assemble
+    uses: video.compose_final
+    needs: [render]
+
+  - id: captions
+    uses: captions.package
+    needs: [assemble]
+    config:
+      formats: [webvtt, srt]
+      burn_in: false

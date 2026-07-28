@@ -47,8 +47,7 @@ class PdfIngestor(DocumentIngestor):
                 for text, _, drawing_count in page_features
             )
             document_is_long_form_text = (
-                bool(page_features)
-                and text_heavy_pages / len(page_features) >= 0.65
+                bool(page_features) and text_heavy_pages / len(page_features) >= 0.65
             )
             slides: list[SlideContent] = []
             for index in range(1, document.page_count + 1):
@@ -56,11 +55,7 @@ class PdfIngestor(DocumentIngestor):
                 word_count = len(text.split())
                 source_frame_suitable = not (
                     document_is_long_form_text
-                    or (
-                        word_count >= 120
-                        and vector_drawings < 3
-                        and embedded_images <= 1
-                    )
+                    or (word_count >= 120 and vector_drawings < 3 and embedded_images <= 1)
                 )
                 slides.append(
                     SlideContent(
@@ -162,4 +157,6 @@ class ExtensionDocumentIngestorFactory:
             return self._strategies[extension]
         except KeyError as exc:
             supported = ", ".join(sorted(self._strategies))
-            raise ValueError(f"Unsupported file type '{extension}'. Supported: {supported}") from exc
+            raise ValueError(
+                f"Unsupported file type '{extension}'. Supported: {supported}"
+            ) from exc

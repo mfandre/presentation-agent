@@ -24,7 +24,7 @@ from presentation_video.domain.models import (
     VisualScenePlan,
 )
 from presentation_video.infrastructure.speech import _delivery_prompt
-from presentation_video.infrastructure.visual_media import _visual_prompt
+from presentation_video.infrastructure.visual_media import _artifact_stem, _visual_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +185,9 @@ class VertexImageAssetGenerator:
             "image/webp": ".webp",
         }.get(mime_type.lower(), ".png")
         output_dir.mkdir(parents=True, exist_ok=True)
-        destination = output_dir / f"scene-{plan.scene_number:03d}-r{revision}{suffix}"
+        destination = output_dir / (
+            f"{_artifact_stem(plan.scene_number, plan.shot_number)}-r{revision}{suffix}"
+        )
         destination.write_bytes(image_bytes)
         _validate_artifact(destination, "image", plan.scene_number)
         logger.info(
@@ -201,6 +203,7 @@ class VertexImageAssetGenerator:
         )
         return VisualArtifact(
             scene_number=plan.scene_number,
+            shot_number=plan.shot_number,
             path=destination,
             kind="image",
             revision=revision,
@@ -280,7 +283,7 @@ class VertexVideoAssetGenerator:
             if not request_id or "/" in request_id:
                 raise ValueError("Vertex video request ID must be a non-empty GCS path segment")
             scene_output_uri = (
-                f"{self._output_gcs_uri}/scene-{image.scene_number:03d}"
+                f"{self._output_gcs_uri}/{_artifact_stem(image.scene_number, image.shot_number)}"
                 f"-r{image.revision}-{request_id}"
             )
         config = types.GenerateVideosConfig(
@@ -337,7 +340,7 @@ class VertexVideoAssetGenerator:
         video = _extract_generated_video(operation)
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        destination = output_dir / f"scene-{image.scene_number:03d}.mp4"
+        destination = output_dir / (f"{_artifact_stem(image.scene_number, image.shot_number)}.mp4")
         video_bytes = getattr(video, "video_bytes", None)
         video_uri = getattr(video, "uri", None)
         if video_bytes:
@@ -375,6 +378,7 @@ class VertexVideoAssetGenerator:
         )
         return VisualArtifact(
             scene_number=image.scene_number,
+            shot_number=image.shot_number,
             path=destination,
             kind="video",
             revision=image.revision,

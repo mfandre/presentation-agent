@@ -138,9 +138,7 @@ class DebugVisualPlanner:
             is_static = item.media_mode == MediaMode.STATIC
             suitable_pages = [page for page in pages if page.source_frame_suitable]
             preserve_source = is_static and bool(suitable_pages)
-            concepts = infer_required_concepts(
-                f"{item.narration} {item.visual_intent} {evidence}"
-            )
+            concepts = infer_required_concepts(f"{item.narration} {item.visual_intent} {evidence}")
             scenes.append(
                 VisualScenePlan(
                     scene_number=item.scene_number,
@@ -285,16 +283,10 @@ def _validate_sequence(
         if not scene.must_show_concepts:
             scene.must_show_concepts = inferred_concepts
         if not scene.concept_visualization:
-            scene.concept_visualization = default_concept_visualization(
-                scene.must_show_concepts
-            )
+            scene.concept_visualization = default_concept_visualization(scene.must_show_concepts)
         if scene.media_mode == MediaMode.STATIC:
             suitable_numbers = (
-                {
-                    slide.number
-                    for slide in document.slides
-                    if slide.source_frame_suitable
-                }
+                {slide.number for slide in document.slides if slide.source_frame_suitable}
                 if document is not None
                 else set(scene.source_slide_numbers)
             )
@@ -382,8 +374,7 @@ def _normalize_visual_beats(
             motion_preset=scene.motion_preset,
         )
     return [
-        beat.model_copy(update={"beat_number": index})
-        for index, beat in enumerate(beats, start=1)
+        beat.model_copy(update={"beat_number": index}) for index, beat in enumerate(beats, start=1)
     ]
 
 

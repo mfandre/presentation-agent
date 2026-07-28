@@ -1,4 +1,4 @@
-import { CheckCircle2, Download, FileJson2, RotateCcw } from "lucide-react";
+import { Captions, CheckCircle2, Download, FileJson2, RotateCcw } from "lucide-react";
 
 import type { VideoJob } from "../api/contracts";
 import { formatDuration } from "../utils/format";
@@ -12,6 +12,8 @@ interface ResultPanelProps {
 export function ResultPanel({ job, assetUrl, onReset }: ResultPanelProps) {
   const videoUrl = job.video_url ? assetUrl(job.video_url) : null;
   const scriptUrl = job.script_url ? assetUrl(job.script_url) : null;
+  const captionsVttUrl = job.captions_vtt_url ? assetUrl(job.captions_vtt_url) : null;
+  const captionsSrtUrl = job.captions_srt_url ? assetUrl(job.captions_srt_url) : null;
 
   return (
     <div className="result-panel">
@@ -36,6 +38,8 @@ export function ResultPanel({ job, assetUrl, onReset }: ResultPanelProps) {
 
       <div className="result-actions">
         {videoUrl && <a className="primary-button" href={videoUrl} download><Download size={18} /> Baixar MP4</a>}
+        {captionsVttUrl && <a className="secondary-button" href={captionsVttUrl} download><Captions size={18} /> Baixar VTT</a>}
+        {captionsSrtUrl && <a className="secondary-button" href={captionsSrtUrl} download><Captions size={18} /> Baixar SRT</a>}
         {scriptUrl && <a className="secondary-button" href={scriptUrl} download><FileJson2 size={18} /> Baixar roteiro</a>}
         <button className="ghost-button" type="button" onClick={onReset}><RotateCcw size={17} /> Novo vídeo</button>
       </div>

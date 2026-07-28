@@ -1,4 +1,4 @@
-import { ChevronDown, Clock3, History, Mic2, Sparkles, WandSparkles } from "lucide-react";
+import { ChevronDown, Clock3, Film, History, Mic2, Presentation, Sparkles, WandSparkles } from "lucide-react";
 import { type FormEvent, useState } from "react";
 
 import type { CreateVideoInput } from "../api/contracts";
@@ -36,6 +36,7 @@ export function ConfigurationForm({
   const [language, setLanguage] = useState("pt-BR");
   const [audience, setAudience] = useState("executive");
   const [tone, setTone] = useState("professional and natural");
+  const [productionMode, setProductionMode] = useState<"hybrid_presentation" | "cinematic_story">("hybrid_presentation");
   const [fileError, setFileError] = useState<string | null>(null);
   const [resumeJobId, setResumeJobId] = useState("");
   const [resumeError, setResumeError] = useState<string | null>(null);
@@ -52,6 +53,7 @@ export function ConfigurationForm({
       language,
       audience,
       tone,
+      productionMode,
     });
   };
 
@@ -74,7 +76,7 @@ export function ConfigurationForm({
           <span className="section-number">1</span>
           <div>
             <h2>Apresentação</h2>
-            <p>O layout original será preservado no vídeo.</p>
+            <p>O documento será usado como fonte factual para construir o vídeo.</p>
           </div>
         </div>
         <FileDropzone
@@ -97,6 +99,40 @@ export function ConfigurationForm({
             <p>Defina para quem a apresentação será contada.</p>
           </div>
         </div>
+
+        <fieldset className="production-mode-field">
+          <legend>Formato visual</legend>
+          <label className={productionMode === "hybrid_presentation" ? "production-mode-card is-selected" : "production-mode-card"}>
+            <input
+              type="radio"
+              name="production-mode"
+              value="hybrid_presentation"
+              checked={productionMode === "hybrid_presentation"}
+              onChange={() => setProductionMode("hybrid_presentation")}
+              disabled={disabled}
+            />
+            <Presentation size={20} />
+            <span>
+              <strong>Apresentação híbrida</strong>
+              <small>Combina cenas geradas com páginas fixas quando números, tabelas ou diagramas precisam ser lidos.</small>
+            </span>
+          </label>
+          <label className={productionMode === "cinematic_story" ? "production-mode-card is-selected" : "production-mode-card"}>
+            <input
+              type="radio"
+              name="production-mode"
+              value="cinematic_story"
+              checked={productionMode === "cinematic_story"}
+              onChange={() => setProductionMode("cinematic_story")}
+              disabled={disabled}
+            />
+            <Film size={20} />
+            <span>
+              <strong>História cinematográfica</strong>
+              <small>Cria imagens e cenas originais do início ao fim, sem mostrar slides, páginas ou documentos fixos.</small>
+            </span>
+          </label>
+        </fieldset>
 
         <div className="field-grid">
           <label className="field">
@@ -148,17 +184,6 @@ export function ConfigurationForm({
           />
           <div className="range-labels"><span>1 min</span><span>10 min</span></div>
         </label>
-      </section>
-
-      <section className="presenter-card" aria-disabled="true">
-        <div className="presenter-card__icon"><Mic2 size={20} /></div>
-        <div>
-          <div className="presenter-card__title">
-            <strong>Apresentador virtual</strong>
-            <span className="badge">Próxima etapa</span>
-          </div>
-          <p>O vídeo usa cenas narrativas próprias, sintetizadas a partir do documento.</p>
-        </div>
       </section>
 
       <button type="submit" className="primary-button" disabled={disabled}>

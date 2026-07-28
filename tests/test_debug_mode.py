@@ -12,6 +12,11 @@ from presentation_video.infrastructure.visual_media import (
 )
 from presentation_video.infrastructure.visual_planning import DebugVisualPlanner
 from presentation_video.settings import Settings
+from presentation_video.workflow.loader import WorkflowLoader
+
+
+def _workflow():
+    return WorkflowLoader(Path("workflows")).load("presentation-video")
 
 
 def _document(page_count: int = 55) -> PresentationDocument:
@@ -33,22 +38,12 @@ def _document(page_count: int = 55) -> PresentationDocument:
 def test_debug_mode_bypasses_paid_provider_configuration(tmp_path: Path) -> None:
     settings = Settings(
         debug_mode=True,
-        narrative_provider="replicate",
-        visual_planner_provider="replicate",
-        visual_image_provider="replicate",
-        visual_media_provider="replicate",
-        tts_provider="replicate",
         replicate_api_token=None,
-        replicate_narrative_model=None,
-        replicate_planner_model=None,
-        replicate_image_model=None,
-        replicate_video_model=None,
-        replicate_tts_model=None,
         work_root=tmp_path / "work",
         output_root=tmp_path / "output",
     )
 
-    pipeline = build_pipeline(settings)
+    pipeline = build_pipeline(settings, workflow=_workflow())
 
     assert isinstance(pipeline._narrative_generator, DebugNarrativeGenerator)
     assert isinstance(pipeline._visual_planner, DebugVisualPlanner)
@@ -58,29 +53,27 @@ def test_debug_mode_bypasses_paid_provider_configuration(tmp_path: Path) -> None
 
 
 def test_bootstrap_rejects_sending_source_slide_text_to_replicate_video() -> None:
-    settings = Settings(
-        debug_mode=False,
-        visual_image_provider="slide",
-        visual_media_provider="replicate",
+    settings = Settings(debug_mode=False)
+    workflow = _workflow()
+    next(step for step in workflow.steps if step.id == "generate_images").config["provider"] = (
+        "slide"
     )
 
     with pytest.raises(ValueError, match="source-page text"):
-        build_pipeline(settings)
+        build_pipeline(settings, workflow=workflow)
 
 
 @pytest.mark.asyncio
 async def test_debug_narrative_groups_large_deck_without_external_llm() -> None:
     generator = DebugNarrativeGenerator(max_scenes=3)
 
-    script = await generator.generate(
-        _document(), 60, "pt-BR", "executive", "professional"
-    )
+    script = await generator.generate(_document(), 60, "pt-BR", "executive", "professional")
 
     assert len(script.scenes) == 3
     assert sum(scene.target_seconds for scene in script.scenes) == 60
-    assert [
-        page for scene in script.scenes for page in scene.source_slide_numbers
-    ] == list(range(1, 56))
+    assert [page for scene in script.scenes for page in scene.source_slide_numbers] == list(
+        range(1, 56)
+    )
 
 
 @pytest.mark.asyncio

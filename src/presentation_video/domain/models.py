@@ -10,20 +10,33 @@ class JobStatus(StrEnum):
     RECEIVED = "received"
     INGESTING = "ingesting"
     SCRIPTING = "scripting"
+    DURATION_VALIDATING = "duration_validating"
+    AWAITING_DURATION_APPROVAL = "awaiting_duration_approval"
+    SYNTHESIZING = "synthesizing"
+    SCENE_PLANNING = "scene_planning"
     VISUAL_PLANNING = "visual_planning"
+    PROMPT_COMPILING = "prompt_compiling"
+    RULE_VALIDATING = "rule_validating"
     GENERATING_IMAGES = "generating_images"
     AWAITING_VISUAL_APPROVAL = "awaiting_visual_approval"
     GENERATING_VIDEO = "generating_video"
-    SYNTHESIZING = "synthesizing"
     RENDERING = "rendering"
+    VISUAL_QA = "visual_qa"
     ASSEMBLING = "assembling"
+    CAPTIONING = "captioning"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
     FAILED = "failed"
 
 
 class MediaMode(StrEnum):
     STATIC = "static"
     VIDEO = "video"
+
+
+class ProductionMode(StrEnum):
+    HYBRID_PRESENTATION = "hybrid_presentation"
+    CINEMATIC_STORY = "cinematic_story"
 
 
 class MotionPreset(StrEnum):
@@ -57,11 +70,28 @@ class VisualBeat(BaseModel):
     transition: TransitionPreset = TransitionPreset.DISSOLVE
 
 
+class VisualShotPlan(BaseModel):
+    shot_number: int = Field(ge=1)
+    start_seconds: float = Field(ge=0)
+    duration_seconds: float = Field(gt=0, le=8)
+    narration_excerpt: str = Field(min_length=1)
+    story_function: str = Field(min_length=1, max_length=120)
+    prompt: str = Field(min_length=1)
+    negative_prompt: str = ""
+    continuity_in: str = ""
+    continuity_out: str = ""
+    camera_motion: str = "subtle cinematic movement"
+    motion_preset: MotionPreset = MotionPreset.SLOW_PUSH
+    transition: TransitionPreset = TransitionPreset.CUT
+    required_concepts: list[str] = Field(default_factory=list)
+
+
 def build_default_visual_beats(
     duration_seconds: int,
     *,
     is_video: bool,
     motion_preset: MotionPreset,
+    allow_source_slide: bool = True,
 ) -> list[VisualBeat]:
     if not is_video:
         return [
@@ -92,14 +122,18 @@ def build_default_visual_beats(
                 motion_preset=motion_preset,
             )
         )
-        slide_duration = remaining - image_duration
-        if slide_duration > 0:
+        final_duration = remaining - image_duration
+        if final_duration > 0:
             beats.append(
                 VisualBeat(
                     beat_number=3,
-                    kind=VisualBeatKind.SOURCE_SLIDE,
-                    duration_seconds=slide_duration,
-                    motion_preset=MotionPreset.NONE,
+                    kind=(
+                        VisualBeatKind.SOURCE_SLIDE
+                        if allow_source_slide
+                        else VisualBeatKind.MOTION_GRAPHIC
+                    ),
+                    duration_seconds=final_duration,
+                    motion_preset=(MotionPreset.NONE if allow_source_slide else motion_preset),
                 )
             )
     return beats
@@ -175,6 +209,7 @@ class PresentationScript(BaseModel):
 
 class VisualScenePlan(BaseModel):
     scene_number: int = Field(ge=1)
+    shot_number: int = Field(default=1, ge=1)
     source_slide_numbers: list[int] = Field(default_factory=list)
     prompt: str = Field(min_length=1)
     media_mode: MediaMode = MediaMode.STATIC
@@ -206,6 +241,7 @@ class VisualScenePlan(BaseModel):
         "realistic documentary photography or faithful flat technical documentation, concrete "
         "operational evidence, natural materials and lighting, source-grounded"
     )
+    shots: list[VisualShotPlan] = Field(default_factory=list)
 
 
 class PresentationVisualPlan(BaseModel):
@@ -215,6 +251,7 @@ class PresentationVisualPlan(BaseModel):
 
 class VisualArtifact(BaseModel):
     scene_number: int = Field(ge=1)
+    shot_number: int = Field(default=1, ge=1)
     path: Path
     kind: str = Field(pattern="^(image|video)$")
     revision: int = Field(default=1, ge=1)
@@ -237,6 +274,7 @@ class VideoJobRequest(BaseModel):
     language: str = "pt-BR"
     audience: str = "executive"
     tone: str = "professional and natural"
+    production_mode: ProductionMode = ProductionMode.HYBRID_PRESENTATION
     avatar_reference: Path | None = None
 
 
@@ -247,6 +285,7 @@ class PreparedVideoJob(BaseModel):
     script: PresentationScript
     visual_plan: PresentationVisualPlan
     visual_images: list[VisualArtifact]
+    aligned_audio: dict[int, AudioArtifact] = Field(default_factory=dict)
     work_dir: Path
     output_dir: Path
     script_path: Path
@@ -259,3 +298,5 @@ class VideoJobResult(BaseModel):
     script_path: Path
     visual_plan_path: Path
     duration_seconds: float
+    captions_vtt_path: Path
+    captions_srt_path: Path

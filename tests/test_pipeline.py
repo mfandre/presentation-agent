@@ -3,7 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from presentation_video.application.pipeline import CreatePresentationVideo, _valid_wav_duration
+from presentation_video.application.pipeline import (
+    CreatePresentationVideo,
+    _cinematic_script,
+    _cinematic_visual_plan,
+    _valid_wav_duration,
+)
 from presentation_video.domain.models import (
     AudioArtifact,
     JobStatus,
@@ -11,13 +16,17 @@ from presentation_video.domain.models import (
     PresentationDocument,
     PresentationScript,
     PresentationVisualPlan,
+    ProductionMode,
     SceneArtifact,
     SceneScript,
     SlideContent,
     VideoJobRequest,
     VisualArtifact,
+    VisualBeat,
+    VisualBeatKind,
     VisualScenePlan,
 )
+from presentation_video.domain.errors import DurationReviewRequired
 
 
 class FakeIngestorFactory:
@@ -51,7 +60,7 @@ class FakeVisualPlanner:
 
 class FakeImageGenerator:
     def __init__(self) -> None:
-        self.calls: list[tuple[int, list[int]]] = []
+        self.calls: list[tuple[int, int, list[int]]] = []
 
     async def generate(
         self,
@@ -60,12 +69,15 @@ class FakeImageGenerator:
         output_dir: Path,
         revision: int = 1,
     ) -> VisualArtifact:
-        self.calls.append((plan.scene_number, [slide.number for slide in source_slides]))
+        self.calls.append(
+            (plan.scene_number, plan.shot_number, [slide.number for slide in source_slides])
+        )
         output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / f"scene-{plan.scene_number}.png"
+        path = output_dir / f"scene-{plan.scene_number}-shot-{plan.shot_number}.png"
         path.write_bytes(b"image")
         return VisualArtifact(
             scene_number=plan.scene_number,
+            shot_number=plan.shot_number,
             path=path,
             kind="image",
             revision=revision,
@@ -111,7 +123,12 @@ class FakeClipGenerator:
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / f"scene-{plan.scene_number}.mp4"
         path.write_bytes(b"clip")
-        return VisualArtifact(scene_number=plan.scene_number, path=path, kind="video")
+        return VisualArtifact(
+            scene_number=plan.scene_number,
+            shot_number=plan.shot_number,
+            path=path,
+            kind="video",
+        )
 
 
 class FakeSceneRenderer:
@@ -227,7 +244,7 @@ async def test_pipeline_processes_narrative_scenes_not_every_source_page(tmp_pat
     prepared = await pipeline.prepare(request, job_id="test-job")
     result = await pipeline.finalize(prepared)
 
-    assert images.calls == [(1, [1, 2, 3])]
+    assert images.calls == [(1, 1, [1, 2, 3])]
     assert speech.calls == ["Opening and context", "Development and conclusion"]
     assert clips.calls == [1]
     assert renderer.calls == [(1, 1, "video"), (2, 4, "image")]
@@ -238,8 +255,82 @@ async def test_pipeline_processes_narrative_scenes_not_every_source_page(tmp_pat
     prepared.visual_images[0].path.unlink()
     restored = await pipeline.restore(request, job_id="test-job")
 
-    assert images.calls == [(1, [1, 2, 3]), (1, [1, 2, 3])]
+    assert images.calls == [(1, 1, [1, 2, 3]), (1, 1, [1, 2, 3])]
     assert [image.scene_number for image in restored.visual_images] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_cinematic_preparation_generates_multiple_reviewable_shots(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"pdf")
+    slide = SlideContent(
+        number=1,
+        title="Transformation",
+        image_path=tmp_path / "page-1.png",
+    )
+    slide.image_path.write_bytes(b"source")
+    document = PresentationDocument(source_path=source, slides=[slide])
+    script = PresentationScript(
+        title="Story",
+        scenes=[
+            SceneScript(
+                scene_number=1,
+                source_slide_numbers=[1],
+                narration="A central engine gives way to autonomous distributed machines.",
+                target_seconds=17,
+                media_mode=MediaMode.STATIC,
+            )
+        ],
+        total_estimated_seconds=17,
+    )
+    visual_plan = PresentationVisualPlan(
+        scenes=[
+            VisualScenePlan(
+                scene_number=1,
+                source_slide_numbers=[1],
+                prompt="A factory transformation grounded in the source.",
+                media_mode=MediaMode.STATIC,
+                preserve_source_frame=True,
+            )
+        ]
+    )
+    images = FakeImageGenerator()
+    pipeline = CreatePresentationVideo(
+        ingestor_factory=FakeIngestorFactory(document),
+        narrative_generator=FakeNarrativeGenerator(script),
+        visual_planner=FakeVisualPlanner(visual_plan),
+        visual_asset_generator=images,
+        video_clip_generator=FakeClipGenerator(),
+        speech_synthesizer=FakeSpeechSynthesizer(),
+        avatar_renderer=FakeAvatarRenderer(),
+        scene_renderer=FakeSceneRenderer(),
+        video_assembler=FakeAssembler(),
+        reporter=FakeReporter(),
+        work_root=tmp_path / "work",
+        output_root=tmp_path / "output",
+    )
+
+    prepared = await pipeline.prepare(
+        VideoJobRequest(
+            source_path=source,
+            target_seconds=30,
+            production_mode=ProductionMode.CINEMATIC_STORY,
+        ),
+        job_id="cinematic-job",
+    )
+
+    shots = prepared.visual_plan.scenes[0].shots
+    assert len(shots) == 2
+    assert all(shot.duration_seconds <= 8 for shot in shots)
+    assert len(prepared.visual_images) == 2
+    assert [(image.scene_number, image.shot_number) for image in prepared.visual_images] == [
+        (1, 1),
+        (1, 2),
+    ]
+    assert all(image.path != slide.image_path for image in prepared.visual_images)
+    assert images.calls == [(1, 1, [1]), (1, 2, [1])]
 
 
 def test_valid_wav_duration_accepts_checkpoint_and_rejects_partial_file(
@@ -256,3 +347,139 @@ def test_valid_wav_duration_accepts_checkpoint_and_rejects_partial_file(
 
     assert _valid_wav_duration(valid) == pytest.approx(1)
     assert _valid_wav_duration(partial) is None
+
+
+def test_cinematic_mode_removes_all_source_frames_and_slide_beats() -> None:
+    script = PresentationScript(
+        title="Story",
+        scenes=[
+            SceneScript(
+                scene_number=1,
+                source_slide_numbers=[1],
+                narration="A transformation begins.",
+                target_seconds=30,
+                media_mode=MediaMode.STATIC,
+            )
+        ],
+        total_estimated_seconds=30,
+    )
+    plan = PresentationVisualPlan(
+        scenes=[
+            VisualScenePlan(
+                scene_number=1,
+                source_slide_numbers=[1],
+                source_slide_number=1,
+                preserve_source_frame=True,
+                media_mode=MediaMode.STATIC,
+                prompt="Show the source page.",
+                visual_beats=[
+                    VisualBeat(
+                        beat_number=1,
+                        kind=VisualBeatKind.SOURCE_SLIDE,
+                        duration_seconds=30,
+                    )
+                ],
+            )
+        ]
+    )
+
+    cinematic_script = _cinematic_script(script)
+    cinematic_plan = _cinematic_visual_plan(plan)
+
+    assert cinematic_script.scenes[0].media_mode == MediaMode.VIDEO
+    assert cinematic_plan.scenes[0].media_mode == MediaMode.VIDEO
+    assert cinematic_plan.scenes[0].preserve_source_frame is False
+    assert cinematic_plan.scenes[0].source_slide_number is None
+    assert all(
+        beat.kind != VisualBeatKind.SOURCE_SLIDE for beat in cinematic_plan.scenes[0].visual_beats
+    )
+
+
+@pytest.mark.asyncio
+async def test_duration_checkpoint_pauses_before_speech_and_can_summarize(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"pdf")
+    slide_paths = [tmp_path / "page-1.png", tmp_path / "page-2.png"]
+    for path in slide_paths:
+        path.write_bytes(b"source")
+    document = PresentationDocument(
+        source_path=source,
+        slides=[
+            SlideContent(number=index, title=f"Page {index}", image_path=path)
+            for index, path in enumerate(slide_paths, start=1)
+        ],
+    )
+    long_text = " ".join(f"palavra{index}" for index in range(100))
+    script = PresentationScript(
+        title="Long story",
+        scenes=[
+            SceneScript(
+                scene_number=1,
+                source_slide_numbers=[1],
+                narration=long_text,
+                target_seconds=15,
+                media_mode=MediaMode.VIDEO,
+            ),
+            SceneScript(
+                scene_number=2,
+                source_slide_numbers=[2],
+                narration=long_text,
+                target_seconds=15,
+                media_mode=MediaMode.STATIC,
+            ),
+        ],
+        total_estimated_seconds=30,
+    )
+    plan = PresentationVisualPlan(
+        scenes=[
+            VisualScenePlan(
+                scene_number=1,
+                source_slide_numbers=[1],
+                prompt="Generated visual",
+                media_mode=MediaMode.VIDEO,
+                preserve_source_frame=False,
+            ),
+            VisualScenePlan(
+                scene_number=2,
+                source_slide_numbers=[2],
+                source_slide_number=2,
+                prompt="Preserved information",
+                media_mode=MediaMode.STATIC,
+                preserve_source_frame=True,
+            ),
+        ]
+    )
+    speech = FakeSpeechSynthesizer()
+    pipeline = CreatePresentationVideo(
+        ingestor_factory=FakeIngestorFactory(document),
+        narrative_generator=FakeNarrativeGenerator(script),
+        visual_planner=FakeVisualPlanner(plan),
+        visual_asset_generator=FakeImageGenerator(),
+        video_clip_generator=FakeClipGenerator(),
+        speech_synthesizer=speech,
+        avatar_renderer=FakeAvatarRenderer(),
+        scene_renderer=FakeSceneRenderer(),
+        video_assembler=FakeAssembler(),
+        reporter=FakeReporter(),
+        work_root=tmp_path / "work",
+        output_root=tmp_path / "output",
+    )
+    request = VideoJobRequest(source_path=source, target_seconds=30)
+
+    with pytest.raises(DurationReviewRequired) as review:
+        await pipeline.prepare(request, job_id="duration-job")
+
+    assert review.value.estimated_seconds > 30
+    assert speech.calls == []
+
+    prepared = await pipeline.prepare(
+        request,
+        job_id="duration-job",
+        duration_decision="summarize",
+    )
+
+    assert sum(len(scene.narration.split()) for scene in prepared.script.scenes) <= 77
+    assert prepared.script.total_estimated_seconds == 30
+    assert len(speech.calls) == 2
