@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
-import re
 import uuid
-import wave
 from pathlib import Path
 
 from presentation_video.domain.models import (
@@ -15,7 +12,6 @@ from presentation_video.domain.models import (
     MediaMode,
     MotionPreset,
     PresentationScript,
-    PresentationVisualPlan,
     ProductionMode,
     PreparedVideoJob,
     SceneArtifact,
@@ -24,7 +20,6 @@ from presentation_video.domain.models import (
     VisualArtifact,
     VisualBeat,
     VisualBeatKind,
-    VisualShotPlan,
     build_default_visual_beats,
 )
 from presentation_video.domain.errors import DurationReviewRequired
@@ -42,219 +37,29 @@ from presentation_video.domain.ports import (
 )
 from presentation_video.application.cinematic import compile_shots, materialize_shot
 from presentation_video.application.captions import build_caption_cues, write_caption_files
-from presentation_video.infrastructure.visual_planning import _validate_sequence
-from presentation_video.infrastructure.process import run_process
-from presentation_video.infrastructure.speech import media_duration
+from presentation_video.application.audio_cache import valid_wav_duration as _valid_wav_duration
+from presentation_video.application.manifest import write_job_manifest
+from presentation_video.application.production_policy import (
+    enforce_cinematic_script as _cinematic_script,
+    enforce_cinematic_visual_plan as _cinematic_visual_plan,
+    shots_or_default as _shots_or_default,
+    validate_cinematic_has_no_source_frames as _validate_cinematic_has_no_source_frames,
+)
+from presentation_video.application.script_policy import (
+    compact_script as _compact_script,
+    retime_script as _retime_script,
+    word_count as _word_count,
+)
+from presentation_video.application.visual_checkpoints import (
+    regenerate_visual,
+    restore_prepared_job,
+)
+from presentation_video.infrastructure.video_sequence import (
+    compose_shot_clips as _compose_shot_clips,
+)
+from presentation_video.infrastructure.visual_planning import validate_sequence
 
 logger = logging.getLogger(__name__)
-
-
-def _shots_or_default(shots: list[VisualShotPlan]) -> list[VisualShotPlan | None]:
-    return list(shots) if shots else [None]
-
-
-def _word_count(script: PresentationScript) -> int:
-    return sum(len(scene.narration.split()) for scene in script.scenes)
-
-
-def _compact_script(
-    script: PresentationScript,
-    target_seconds: int,
-    words_per_minute: int,
-) -> PresentationScript:
-    maximum_words = math.floor(target_seconds * words_per_minute / 60)
-    current_counts = [max(len(scene.narration.split()), 1) for scene in script.scenes]
-    total = sum(current_counts)
-    raw_budgets = [maximum_words * count / total for count in current_counts]
-    budgets = [max(1, math.floor(value)) for value in raw_budgets]
-    while sum(budgets) > maximum_words:
-        largest = max(range(len(budgets)), key=budgets.__getitem__)
-        budgets[largest] -= 1
-    for index in sorted(
-        range(len(budgets)),
-        key=lambda item: raw_budgets[item] - math.floor(raw_budgets[item]),
-        reverse=True,
-    ):
-        if sum(budgets) >= maximum_words:
-            break
-        budgets[index] += 1
-
-    scenes = []
-    for scene, budget in zip(script.scenes, budgets, strict=True):
-        words = scene.narration.split()
-        if len(words) <= budget:
-            narration = scene.narration
-        else:
-            sentences = re.split(r"(?<=[.!?])\s+", scene.narration.strip())
-            selected: list[str] = []
-            used = 0
-            for sentence in sentences:
-                sentence_words = sentence.split()
-                if used + len(sentence_words) > budget:
-                    break
-                selected.append(sentence)
-                used += len(sentence_words)
-            narration = (
-                " ".join(selected)
-                if selected
-                else " ".join(words[:budget]).rstrip(".,;:") + "."
-            )
-        scenes.append(scene.model_copy(update={"narration": narration}))
-    weights = [max(len(scene.narration.split()), 1) for scene in scenes]
-    durations = [max(1, round(target_seconds * weight / sum(weights))) for weight in weights]
-    durations[-1] += target_seconds - sum(durations)
-    return script.model_copy(
-        update={
-            "scenes": [
-                scene.model_copy(update={"target_seconds": duration})
-                for scene, duration in zip(scenes, durations, strict=True)
-            ],
-            "total_estimated_seconds": target_seconds,
-        }
-    )
-
-
-def _retime_script(script: PresentationScript, target_seconds: int) -> PresentationScript:
-    weights = [max(len(scene.narration.split()), 1) for scene in script.scenes]
-    durations = [max(1, round(target_seconds * weight / sum(weights))) for weight in weights]
-    durations[-1] += target_seconds - sum(durations)
-    return script.model_copy(
-        update={
-            "scenes": [
-                scene.model_copy(update={"target_seconds": duration})
-                for scene, duration in zip(script.scenes, durations, strict=True)
-            ],
-            "total_estimated_seconds": target_seconds,
-        }
-    )
-
-
-def _cinematic_script(script: PresentationScript) -> PresentationScript:
-    return script.model_copy(
-        update={
-            "scenes": [
-                scene.model_copy(
-                    update={
-                        "media_mode": MediaMode.VIDEO,
-                        "visual_intent": (
-                            f"{scene.visual_intent}. Create an original cinematic scene "
-                            "grounded in the source meaning; never reproduce a source page "
-                            "or document."
-                        ),
-                    }
-                )
-                for scene in script.scenes
-            ]
-        }
-    )
-
-
-def _cinematic_visual_plan(plan: PresentationVisualPlan) -> PresentationVisualPlan:
-    def adapt(scene):
-        return scene.model_copy(
-            update={
-                "media_mode": MediaMode.VIDEO,
-                "source_slide_number": None,
-                "preserve_source_frame": False,
-                "visual_beats": [
-                    beat.model_copy(
-                        update={
-                            "kind": (
-                                VisualBeatKind.GENERATED_IMAGE
-                                if beat.kind == VisualBeatKind.SOURCE_SLIDE
-                                else beat.kind
-                            )
-                        }
-                    )
-                    for beat in scene.visual_beats
-                ],
-                "prompt": (
-                    f"{scene.prompt} Original cinematic shot only. No slide, page, "
-                    "document, presentation layout, readable text, caption, or interface."
-                ),
-            }
-        )
-
-    return plan.model_copy(
-        update={
-            "scenes": [adapt(scene) for scene in plan.scenes]
-        }
-    )
-
-
-def _validate_cinematic_has_no_source_frames(plan: PresentationVisualPlan) -> None:
-    invalid = [
-        scene.scene_number
-        for scene in plan.scenes
-        if (
-            scene.media_mode != MediaMode.VIDEO
-            or scene.preserve_source_frame
-            or scene.source_slide_number is not None
-            or any(beat.kind == VisualBeatKind.SOURCE_SLIDE for beat in scene.visual_beats)
-        )
-    ]
-    if invalid:
-        raise ValueError(
-            "cinematic_story cannot contain source pages or static scenes; "
-            f"invalid scenes: {invalid}"
-        )
-
-
-async def _compose_shot_clips(
-    scene_number: int,
-    shots: list[tuple[VisualArtifact, float]],
-    output_path: Path,
-) -> VisualArtifact:
-    if not shots:
-        raise ValueError(f"scene {scene_number} has no generated shots")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    input_args: list[str] = []
-    filters: list[str] = []
-    labels: list[str] = []
-    for index, (artifact, duration) in enumerate(shots):
-        if not artifact.path.is_file() or artifact.path.stat().st_size == 0:
-            raise ValueError(
-                f"visual QA failed for scene {scene_number}, shot {artifact.shot_number}"
-            )
-        actual_duration = await media_duration(artifact.path)
-        if actual_duration <= 0:
-            raise ValueError(
-                f"visual QA found an empty clip for scene {scene_number}, "
-                f"shot {artifact.shot_number}"
-            )
-        input_args.extend(["-i", str(artifact.path)])
-        filters.append(
-            f"[{index}:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
-            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,"
-            f"trim=duration={min(duration, actual_duration):.3f},"
-            "setpts=PTS-STARTPTS,fps=30,setsar=1,format=yuv420p"
-            f"[shot{index}]"
-        )
-        labels.append(f"[shot{index}]")
-    filters.append(f"{''.join(labels)}concat=n={len(shots)}:v=1:a=0[outv]")
-    await run_process(
-        "ffmpeg",
-        "-y",
-        *input_args,
-        "-filter_complex",
-        ";".join(filters),
-        "-map",
-        "[outv]",
-        "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    )
-    return VisualArtifact(
-        scene_number=scene_number,
-        path=output_path,
-        kind="video",
-    )
-
 
 class CreatePresentationVideo:
     """Two-phase use case: prepare reviewable images, then animate approved images."""
@@ -296,101 +101,14 @@ class CreatePresentationVideo:
         self._words_per_minute = words_per_minute
 
     async def restore(self, request: VideoJobRequest, job_id: str) -> PreparedVideoJob:
-        """Rebuild a prepared job, generating only visual artifacts missing from its checkpoint."""
-        work_dir = self._work_root / job_id
-        output_dir = self._output_root / job_id
-        script_path = output_dir / "script.json"
-        visual_plan_path = output_dir / "visual-plan.json"
-        if not request.source_path.is_file():
-            raise FileNotFoundError(f"Source file not found for job {job_id}")
-        if not script_path.is_file() or not visual_plan_path.is_file():
-            raise FileNotFoundError(f"Job {job_id} has not completed visual preparation")
-
-        document = await self._ingestor_factory.create(request.source_path).ingest(
-            request.source_path, work_dir
-        )
-        script = PresentationScript.model_validate_json(script_path.read_text(encoding="utf-8"))
-        visual_plan = PresentationVisualPlan.model_validate_json(
-            visual_plan_path.read_text(encoding="utf-8")
-        )
-        _validate_sequence(visual_plan, script, document)
-        visual_plan_path.write_text(
-            visual_plan.model_dump_json(indent=2),
-            encoding="utf-8",
-        )
-        slides = {slide.number: slide for slide in document.slides}
-        scripts = {scene.scene_number: scene for scene in script.scenes}
-        images: list[VisualArtifact] = []
-        completed_images = 0
-        shot_total = sum(max(len(plan.shots), 1) for plan in visual_plan.scenes)
-        for scene_plan in visual_plan.scenes:
-            for shot in _shots_or_default(scene_plan.shots):
-                shot_number = shot.shot_number if shot else 1
-                plan = materialize_shot(scene_plan, shot) if shot else scene_plan
-                if plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
-                    source_number = plan.source_slide_number or plan.source_slide_numbers[0]
-                    try:
-                        image_path = slides[source_number].image_path
-                    except KeyError as exc:
-                        raise FileNotFoundError(
-                            f"Source slide {source_number} is unavailable for scene "
-                            f"{plan.scene_number}"
-                        ) from exc
-                    revision = 1
-                else:
-                    stem = f"scene-{plan.scene_number:03d}"
-                    if shot_number > 1:
-                        stem += f"-shot-{shot_number:03d}"
-                    candidates = sorted((work_dir / "images").glob(f"{stem}-r*.*"))
-                    if not candidates:
-                        scene_script = scripts[plan.scene_number]
-                        source_slides = [
-                            slides[number] for number in scene_script.source_slide_numbers
-                        ]
-                        logger.info(
-                            "job=%s restoring missing generated image scene=%s shot=%s",
-                            job_id,
-                            plan.scene_number,
-                            shot_number,
-                        )
-                        image = await self._visual_asset_generator.generate(
-                            plan,
-                            source_slides,
-                            work_dir / "images",
-                        )
-                        image_path = image.path
-                        revision = image.revision
-                    else:
-                        image_path = candidates[-1]
-                        match = image_path.stem.rsplit("-r", 1)
-                        revision = int(match[1]) if len(match) == 2 and match[1].isdigit() else 1
-                artifact = VisualArtifact(
-                    scene_number=plan.scene_number,
-                    shot_number=shot_number,
-                    path=image_path,
-                    kind="image",
-                    revision=revision,
-                )
-                images.append(artifact)
-                completed_images += 1
-                await self._reporter.update(
-                    job_id,
-                    JobStatus.GENERATING_IMAGES,
-                    f"completed={completed_images} total={shot_total}"
-                    f" | frame da cena {plan.scene_number}, take {shot_number} recuperado",
-                )
-
-        return PreparedVideoJob(
-            job_id=job_id,
-            request=request,
-            document=document,
-            script=script,
-            visual_plan=visual_plan,
-            visual_images=images,
-            work_dir=work_dir,
-            output_dir=output_dir,
-            script_path=script_path,
-            visual_plan_path=visual_plan_path,
+        return await restore_prepared_job(
+            request,
+            job_id,
+            work_root=self._work_root,
+            output_root=self._output_root,
+            ingestor_factory=self._ingestor_factory,
+            visual_asset_generator=self._visual_asset_generator,
+            reporter=self._reporter,
         )
 
     async def prepare(
@@ -551,7 +269,7 @@ class CreatePresentationVideo:
                 JobStatus.RULE_VALIDATING,
                 "Validando duração, cobertura e regras de mídia",
             )
-            _validate_sequence(visual_plan, script, document)
+            validate_sequence(visual_plan, script, document)
             visual_plan_path = output_dir / "visual-plan.json"
             visual_plan_path.write_text(visual_plan.model_dump_json(indent=2), encoding="utf-8")
             logger.info(
@@ -682,76 +400,14 @@ class CreatePresentationVideo:
         shot_number: int = 1,
         prompt: str | None = None,
     ) -> VisualArtifact:
-        slides = {slide.number: slide for slide in prepared.document.slides}
-        scripts = {scene.scene_number: scene for scene in prepared.script.scenes}
-        plans = {plan.scene_number: plan for plan in prepared.visual_plan.scenes}
-        images = {
-            (image.scene_number, image.shot_number): image for image in prepared.visual_images
-        }
-        image_key = (scene_number, shot_number)
-        if scene_number not in scripts or scene_number not in plans or image_key not in images:
-            raise ValueError(f"Scene {scene_number}, shot {shot_number} does not exist")
-        if (
-            plans[scene_number].media_mode == MediaMode.STATIC
-            and plans[scene_number].preserve_source_frame
-        ):
-            raise ValueError(
-                "Static scenes preserve an original source page and cannot be regenerated "
-                "from a prompt"
-            )
-        scene_plan = plans[scene_number]
-        shot = scene_plan.shots[shot_number - 1] if scene_plan.shots else None
-        generation_plan = materialize_shot(scene_plan, shot) if shot else scene_plan
-        previous_prompt = generation_plan.prompt
-        if prompt is not None:
-            if shot:
-                shot.prompt = prompt.strip()
-                generation_plan = materialize_shot(scene_plan, shot)
-            else:
-                scene_plan.prompt = prompt.strip()
-                generation_plan = scene_plan
-        revision = images[image_key].revision + 1
-        logger.info(
-            "job=%s image regeneration started scene=%s shot=%s revision=%s prompt_updated=%s "
-            "prompt_characters=%s",
-            prepared.job_id,
+        return await regenerate_visual(
+            prepared,
             scene_number,
             shot_number,
-            revision,
-            prompt is not None,
-            len(generation_plan.prompt),
+            prompt,
+            visual_asset_generator=self._visual_asset_generator,
+            semaphore=self._semaphore,
         )
-        try:
-            async with self._semaphore:
-                replacement = await self._visual_asset_generator.generate(
-                    generation_plan,
-                    [slides[number] for number in scripts[scene_number].source_slide_numbers],
-                    prepared.work_dir / "images",
-                    revision=revision,
-                )
-        except Exception:
-            if shot:
-                shot.prompt = previous_prompt
-            else:
-                scene_plan.prompt = previous_prompt
-            raise
-        prepared.visual_plan_path.write_text(
-            prepared.visual_plan.model_dump_json(indent=2),
-            encoding="utf-8",
-        )
-        prepared.visual_images = [
-            replacement if (image.scene_number, image.shot_number) == image_key else image
-            for image in prepared.visual_images
-        ]
-        logger.info(
-            "job=%s image regeneration completed scene=%s shot=%s revision=%s path=%s",
-            prepared.job_id,
-            scene_number,
-            shot_number,
-            revision,
-            replacement.path,
-        )
-        return replacement
 
     async def finalize(self, prepared: PreparedVideoJob) -> VideoJobResult:
         job_id = prepared.job_id
@@ -1043,31 +699,14 @@ class CreatePresentationVideo:
                 duration,
                 video_path,
             )
-            manifest = {
-                "job_id": job_id,
-                "source": str(prepared.request.source_path),
-                "video": str(video_path),
-                "duration_seconds": duration,
-                "target_seconds": prepared.request.target_seconds,
-                "language": prepared.request.language,
-                "audience": prepared.request.audience,
-                "tone": prepared.request.tone,
-                "production_mode": prepared.request.production_mode.value,
-                "approved_images": [
-                    image.model_dump(mode="json") for image in prepared.visual_images
-                ],
-                "storyboard": [
-                    plan.model_dump(mode="json") for plan in prepared.visual_plan.scenes
-                ],
-                "captions": {
-                    "vtt": str(captions_vtt_path),
-                    "srt": str(captions_srt_path),
-                    "cue_count": len(caption_cues),
-                },
-                "scenes": [scene.model_dump(mode="json") for scene in scenes],
-            }
-            (prepared.output_dir / "manifest.json").write_text(
-                json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+            write_job_manifest(
+                prepared,
+                video_path=video_path,
+                duration_seconds=duration,
+                captions_vtt_path=captions_vtt_path,
+                captions_srt_path=captions_srt_path,
+                caption_cue_count=len(caption_cues),
+                scenes=scenes,
             )
             await self._reporter.update(job_id, JobStatus.COMPLETED)
             return VideoJobResult(
@@ -1088,15 +727,3 @@ class CreatePresentationVideo:
         """CLI convenience: prepare and immediately approve all first-generation images."""
         prepared = await self.prepare(request, job_id)
         return await self.finalize(prepared)
-
-
-def _valid_wav_duration(path: Path) -> float | None:
-    if not path.is_file() or path.stat().st_size <= 44:
-        return None
-    try:
-        with wave.open(str(path), "rb") as audio:
-            frame_rate = audio.getframerate()
-            duration = audio.getnframes() / frame_rate if frame_rate else 0
-    except (OSError, EOFError, wave.Error):
-        return None
-    return duration if duration > 0 else None

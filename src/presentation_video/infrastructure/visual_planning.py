@@ -257,7 +257,7 @@ def _payload(document: PresentationDocument, script: PresentationScript) -> dict
     }
 
 
-def _validate_sequence(
+def validate_sequence(
     plan: PresentationVisualPlan,
     script: PresentationScript,
     document: PresentationDocument | None = None,
@@ -327,6 +327,10 @@ def _validate_sequence(
                 scene.negative_prompt = f"{hard_exclusions}, {scene.negative_prompt}"
         scene.visual_beats = _normalize_visual_beats(scene, script_scene.target_seconds)
     plan.creative_direction = script.creative_direction
+
+
+# Backwards-compatible alias for integrations that imported the former private helper.
+_validate_sequence = validate_sequence
 
 
 def _plan_issues(plan: PresentationVisualPlan, script: PresentationScript) -> list[str]:
