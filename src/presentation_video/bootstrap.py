@@ -274,6 +274,9 @@ def build_pipeline(
             aspect_ratio=str(runtime.raw("animate").get("aspect_ratio", "16:9")),
             clip_duration_seconds=int(runtime.raw("animate").get("duration_seconds", 8)),
             timeout_seconds=video_config.timeout_seconds,
+            store_output_in_gcs=bool(
+                runtime.raw("animate").get("store_output_in_gcs", False)
+            ),
         )
     else:
         raise ValueError(
