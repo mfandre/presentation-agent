@@ -267,13 +267,59 @@ class WorkflowExecutor:
 
     def _resolve_condition(
         self,
-        condition: bool | str,
+        condition: bool | str | dict[str, Any],
         workflow_inputs: dict[str, Any],
         states: dict[str, StepRun],
         item: Any,
     ) -> bool:
         if isinstance(condition, bool):
             return condition
+        if isinstance(condition, dict):
+            allowed = {"input", "reference", "equals", "not_equals", "in", "not_in"}
+            unknown = set(condition) - allowed
+            if unknown:
+                raise ValueError(
+                    f"workflow condition contains unsupported keys {sorted(unknown)}"
+                )
+            if ("input" in condition) == ("reference" in condition):
+                raise ValueError(
+                    "workflow condition must define exactly one of input or reference"
+                )
+            if "input" in condition:
+                input_name = condition["input"]
+                if not isinstance(input_name, str) or input_name not in workflow_inputs:
+                    raise ValueError(f"workflow condition references unknown input {input_name!r}")
+                resolved = workflow_inputs[input_name]
+            else:
+                resolved = self._resolve_value(
+                    condition["reference"],
+                    workflow_inputs,
+                    states,
+                    item,
+                )
+            operators = [
+                name
+                for name in ("equals", "not_equals", "in", "not_in")
+                if name in condition
+            ]
+            if len(operators) != 1:
+                raise ValueError(
+                    "workflow condition must define exactly one comparison operator"
+                )
+            operator = operators[0]
+            expected = self._resolve_value(
+                condition[operator],
+                workflow_inputs,
+                states,
+                item,
+            )
+            if operator == "equals":
+                return resolved == expected
+            if operator == "not_equals":
+                return resolved != expected
+            if not isinstance(expected, (list, tuple, set)):
+                raise ValueError(f"workflow condition operator {operator} requires a collection")
+            return resolved in expected if operator == "in" else resolved not in expected
         resolved = self._resolve_value(condition, workflow_inputs, states, item)
         if not isinstance(resolved, bool):
             raise ValueError("workflow condition must resolve to a boolean")

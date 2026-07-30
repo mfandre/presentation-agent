@@ -376,6 +376,7 @@ def _normalize_visual_beats(
             duration_seconds,
             is_video=scene.media_mode == MediaMode.VIDEO,
             motion_preset=scene.motion_preset,
+            allow_source_slide=scene.preserve_source_frame,
         )
     return [
         beat.model_copy(update={"beat_number": index}) for index, beat in enumerate(beats, start=1)

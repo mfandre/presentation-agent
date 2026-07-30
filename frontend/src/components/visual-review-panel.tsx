@@ -6,6 +6,7 @@ import {
   Image,
   LoaderCircle,
   PencilLine,
+  PanelsTopLeft,
   RefreshCw,
   Sparkles,
 } from "lucide-react";
@@ -18,6 +19,8 @@ interface VisualReviewPanelProps {
   error: string | null;
   assetUrl(path: string): string;
   onRegenerate(sceneNumber: number, shotNumber: number, prompt: string): Promise<void>;
+  onUseSourceSlide(sceneNumber: number, shotNumber: number, sourceSlideNumber: number): Promise<void>;
+  onGenerateFromSourceSlide(sceneNumber: number, shotNumber: number, sourceSlideNumber: number, prompt: string): Promise<void>;
   onApprove(): Promise<void>;
 }
 
@@ -40,12 +43,41 @@ function formatSourcePages(pages: number[]): string {
   return ranges.join(", ");
 }
 
+const instructionalBadges = {
+  concept: {
+    label: "Conceito",
+    description: "Explica uma ideia central por meio de uma representação visual.",
+  },
+  process: {
+    label: "Processo",
+    description: "Demonstra uma sequência de etapas ou ações em ordem.",
+  },
+  rule: {
+    label: "Regra",
+    description: "Apresenta uma norma, obrigação, prazo, limite ou critério importante.",
+  },
+  behavior: {
+    label: "Comportamento",
+    description: "Mostra uma conduta esperada ou uma situação prática de trabalho.",
+  },
+  system_demo: {
+    label: "Sistema",
+    description: "Ensina uma interação com sistema, portal, tela ou formulário.",
+  },
+  recap: {
+    label: "Resumo",
+    description: "Reforça os principais aprendizados apresentados anteriormente.",
+  },
+} as const;
+
 export function VisualReviewPanel({
   job,
   isActing,
   error,
   assetUrl,
   onRegenerate,
+  onUseSourceSlide,
+  onGenerateFromSourceSlide,
   onApprove,
 }: VisualReviewPanelProps) {
   const [editedPrompts, setEditedPrompts] = useState<Record<string, string>>({});
@@ -53,6 +85,11 @@ export function VisualReviewPanel({
     const first = job.scene_images.find((scene) => scene.media_mode === "video");
     return first ? { [`${first.scene_number}-${first.shot_number}`]: true } : {};
   });
+  const [selectedPages, setSelectedPages] = useState<Record<string, number>>({});
+  const [activeSourceAction, setActiveSourceAction] = useState<{
+    key: string;
+    action: "use" | "generate";
+  } | null>(null);
 
   const staticCount = job.scene_images.filter((scene) => scene.preserve_source_frame).length;
   const illustrationCount = job.scene_images.filter(
@@ -67,6 +104,19 @@ export function VisualReviewPanel({
     }));
   };
 
+  const runSourceAction = async (
+    key: string,
+    action: "use" | "generate",
+    operation: () => Promise<void>,
+  ) => {
+    setActiveSourceAction({ key, action });
+    try {
+      await operation();
+    } finally {
+      setActiveSourceAction(null);
+    }
+  };
+
   return (
     <div className="visual-review">
       <div className="visual-review__heading">
@@ -76,11 +126,19 @@ export function VisualReviewPanel({
           <h2>
             {job.production_mode === "cinematic_story"
               ? "Aprove o storyboard cinematográfico"
+              : job.production_mode === "whiteboard_explainer"
+                ? "Aprove o storyboard whiteboard"
+                : job.production_mode === "corporate_training"
+                  ? "Aprove o storyboard instrucional"
               : "Aprove o storyboard híbrido"}
           </h2>
           <p>
             {job.production_mode === "cinematic_story"
               ? "Cada cartão é um take de até 8 segundos, sincronizado a um trecho específico da narração."
+              : job.production_mode === "whiteboard_explainer"
+                ? "Cada cartão mostra um quadro didático que será construído progressivamente durante a narração."
+                : job.production_mode === "corporate_training"
+                  ? "Todo o conteúdo é reconstruído na identidade do treinamento; informações densas usam composições editoriais estáticas e cenas demonstrativas usam takes curtos."
               : "Slides fixos preservam informações legíveis. Somente os frames marcados como vídeo serão animados."}
           </p>
         </div>
@@ -144,10 +202,20 @@ export function VisualReviewPanel({
         {job.scene_images.map((scene) => {
           const shotKey = `${scene.scene_number}-${scene.shot_number}`;
           const isVideo = scene.media_mode === "video";
+          const isInstructionalStill = (
+            job.production_mode === "corporate_training"
+            && scene.media_mode === "static"
+            && !scene.preserve_source_frame
+          );
+          const canPromptRegenerate = isVideo || !scene.preserve_source_frame;
+          const isEditable = true;
           const regenerating = job.regenerating_scene_numbers.includes(scene.scene_number);
           const editedPrompt = editedPrompts[shotKey] ?? scene.prompt;
           const editorOpen = Boolean(openEditors[shotKey]);
           const editorId = `scene-${scene.scene_number}-shot-${scene.shot_number}-prompt-editor`;
+          const selectedPage = selectedPages[shotKey] ?? scene.source_slide_number ?? scene.source_slide_numbers[0] ?? job.source_pages[0]?.number;
+          const usingSourceSlide = activeSourceAction?.key === shotKey && activeSourceAction.action === "use";
+          const generatingFromSource = activeSourceAction?.key === shotKey && activeSourceAction.action === "generate";
           return (
             <article
               className={`visual-card visual-card--${scene.media_mode}${editorOpen ? " visual-card--editing" : ""}`}
@@ -161,9 +229,21 @@ export function VisualReviewPanel({
                   {isVideo ? <Clapperboard size={13} /> : <FileText size={13} />}
                   {isVideo
                     ? "Vídeo sem texto"
-                    : scene.preserve_source_frame ? "Slide fixo" : "Ilustração editorial"}
+                    : isInstructionalStill
+                      ? "Ilustração instrucional"
+                      : scene.preserve_source_frame ? "Captura fiel" : "Ilustração editorial"}
                 </em>
-                {(isVideo || !scene.preserve_source_frame) ? <button
+                {scene.instructional_type && (
+                  <span
+                    className="visual-card__instructional-type"
+                    data-tooltip={instructionalBadges[scene.instructional_type].description}
+                    aria-label={`${instructionalBadges[scene.instructional_type].label}: ${instructionalBadges[scene.instructional_type].description}`}
+                    tabIndex={0}
+                  >
+                    {instructionalBadges[scene.instructional_type].label}
+                  </span>
+                )}
+                {isEditable ? <button
                   className="visual-card__edit"
                   type="button"
                   aria-expanded={editorOpen}
@@ -173,10 +253,10 @@ export function VisualReviewPanel({
                   <PencilLine size={15} />
                   {editorOpen ? "Fechar editor" : "Editar prompt e regenerar"}
                 </button> : <div className="visual-card__static-note">
-                  Texto preservado da página {scene.source_slide_number ?? scene.source_slide_numbers[0]}
+                  Conteúdo preservado da página {scene.source_slide_number ?? scene.source_slide_numbers[0]}
                 </div>}
               </div>
-              {(isVideo || !scene.preserve_source_frame) && editorOpen && <div className="visual-card__body" id={editorId}>
+              {isEditable && editorOpen && <div className="visual-card__body" id={editorId}>
                 <div className="visual-card__editor-heading">
                   <div>
                     <strong>Personalize o take {scene.shot_number} da cena {scene.scene_number}</strong>
@@ -233,7 +313,7 @@ export function VisualReviewPanel({
                     ))}
                   </div>
                 )}
-                <button
+                {canPromptRegenerate && <button
                   className="secondary-button visual-card__action"
                   type="button"
                   disabled={isActing || regenerating || editedPrompt.trim().length < 3}
@@ -245,7 +325,56 @@ export function VisualReviewPanel({
                 >
                   {regenerating ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
                   {regenerating ? "Gerando nova versão..." : "Regenerar imagem com este prompt"}
-                </button>
+                </button>}
+                {job.source_pages.length > 0 && job.production_mode !== "whiteboard_explainer" && <div className="source-slide-tools">
+                  <div className="source-slide-tools__heading"><PanelsTopLeft size={16} /><strong>Usar conteúdo existente</strong></div>
+                  <div className="source-slide-gallery">
+                    {job.source_pages.map((page) => (
+                      <button
+                        className={selectedPage === page.number ? "is-selected" : ""}
+                        type="button"
+                        key={page.number}
+                        onClick={() => setSelectedPages((current) => ({ ...current, [shotKey]: page.number }))}
+                      >
+                        <img src={assetUrl(page.image_url)} alt={`Página ${page.number}: ${page.title}`} />
+                        <span>Página {page.number}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="source-slide-tools__actions">
+                    {job.production_mode === "hybrid_presentation" && <button
+                      className="secondary-button"
+                      type="button"
+                      disabled={isActing || !selectedPage}
+                      onClick={() => selectedPage && void runSourceAction(
+                        shotKey,
+                        "use",
+                        () => onUseSourceSlide(scene.scene_number, scene.shot_number, selectedPage),
+                      )}
+                    >
+                      {usingSourceSlide ? <LoaderCircle className="spin" size={15} /> : <FileText size={15} />}
+                      {usingSourceSlide ? "Aplicando slide..." : "Usar slide sem animar"}
+                    </button>}
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      disabled={isActing || regenerating || !selectedPage}
+                      onClick={() => selectedPage && void runSourceAction(
+                        shotKey,
+                        "generate",
+                        () => onGenerateFromSourceSlide(
+                          scene.scene_number,
+                          scene.shot_number,
+                          selectedPage,
+                          editedPrompt.trim(),
+                        ),
+                      )}
+                    >
+                      {generatingFromSource ? <LoaderCircle className="spin" size={15} /> : <Sparkles size={15} />}
+                      {generatingFromSource ? "Criando nova imagem..." : "Criar imagem baseada nele"}
+                    </button>
+                  </div>
+                </div>}
               </div>}
             </article>
           );

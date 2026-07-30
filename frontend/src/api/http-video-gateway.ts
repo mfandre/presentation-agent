@@ -1,5 +1,8 @@
 import type {
   CreateVideoInput,
+  BrandKit,
+  BrandKitUpdate,
+  ProductionPreset,
   RuntimeConfig,
   VideoGateway,
   VideoJob,
@@ -25,6 +28,31 @@ export class HttpVideoGateway implements VideoGateway {
     return this.request<RuntimeConfig>("/v1/config");
   }
 
+  async getProductionPresets(): Promise<ProductionPreset[]> {
+    return this.request<ProductionPreset[]>("/v1/production-presets");
+  }
+
+  async getBrandKit(): Promise<BrandKit> {
+    return this.request<BrandKit>("/v1/brand-kit");
+  }
+
+  async updateBrandKit(input: BrandKitUpdate): Promise<BrandKit> {
+    return this.request<BrandKit>("/v1/brand-kit", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+  }
+
+  async uploadBrandAsset(kind: "logo" | "opening_image" | "closing_image", file: File): Promise<BrandKit> {
+    const form = new FormData();
+    form.append("file", file);
+    return this.request<BrandKit>(`/v1/brand-kit/assets/${kind}`, {
+      method: "POST",
+      body: form,
+    });
+  }
+
   async getWorkflows(): Promise<WorkflowDefinition[]> {
     return this.request<WorkflowDefinition[]>("/v1/workflows");
   }
@@ -41,6 +69,7 @@ export class HttpVideoGateway implements VideoGateway {
     form.append("audience", input.audience);
     form.append("tone", input.tone);
     form.append("production_mode", input.productionMode);
+    form.append("preset_options", JSON.stringify(input.presetOptions));
 
     return this.request<VideoJob>("/v1/videos", {
       method: "POST",
@@ -60,6 +89,22 @@ export class HttpVideoGateway implements VideoGateway {
     });
   }
 
+  async useSourceSlide(jobId: string, sceneNumber: number, shotNumber: number, sourceSlideNumber: number): Promise<VideoJob> {
+    return this.request<VideoJob>(`/v1/videos/${jobId}/scenes/${sceneNumber}/use-source-slide?shot_number=${shotNumber}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_slide_number: sourceSlideNumber }),
+    });
+  }
+
+  async generateFromSourceSlide(jobId: string, sceneNumber: number, shotNumber: number, sourceSlideNumber: number, prompt: string): Promise<VideoJob> {
+    return this.request<VideoJob>(`/v1/videos/${jobId}/scenes/${sceneNumber}/generate-from-source-slide?shot_number=${shotNumber}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_slide_number: sourceSlideNumber, prompt }),
+    });
+  }
+
   async approveVisuals(jobId: string): Promise<VideoJob> {
     return this.request<VideoJob>(`/v1/videos/${jobId}/approve-visuals`, { method: "POST" });
   }
@@ -70,6 +115,10 @@ export class HttpVideoGateway implements VideoGateway {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ decision }),
     });
+  }
+
+  async cancelVideo(jobId: string): Promise<VideoJob> {
+    return this.request<VideoJob>(`/v1/videos/${jobId}/cancel`, { method: "POST" });
   }
 
   async resumeVideo(jobId: string): Promise<VideoJob> {

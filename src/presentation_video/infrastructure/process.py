@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import subprocess
 import time
 from pathlib import Path
 
@@ -13,6 +14,58 @@ logger = logging.getLogger(__name__)
 
 class ProcessExecutionError(UserFacingError):
     pass
+
+
+def _run_process_blocking(
+    args: tuple[str, ...],
+    *,
+    cwd: Path | None,
+    timeout_seconds: float,
+    command_summary: str,
+) -> str:
+    """Fallback for event loops that do not implement subprocess transports."""
+    started_at = time.monotonic()
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        executable = args[0] if args else "unknown"
+        raise MissingMediaDependencyError(
+            f"Required media executable was not found: {executable}",
+            "O servidor não possui todas as ferramentas necessárias para gerar áudio e vídeo. "
+            "Peça ao administrador para instalar eSpeak NG e FFmpeg.",
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ProcessExecutionError(
+            f"Command timed out after {timeout_seconds}s: {command_summary}",
+            "A renderização excedeu o tempo máximo e foi interrompida.",
+        ) from exc
+    if completed.returncode != 0:
+        stderr_text = completed.stderr.decode(errors="replace")
+        logger.error(
+            "blocking process failed executable=%s returncode=%s elapsed_seconds=%.1f stderr=%s",
+            args[0] if args else "unknown",
+            completed.returncode,
+            time.monotonic() - started_at,
+            stderr_text[-4_000:],
+        )
+        raise ProcessExecutionError(
+            f"Command failed ({completed.returncode}): {command_summary}\n{stderr_text}",
+            "Não foi possível processar uma das cenas do vídeo. Consulte os logs do servidor.",
+        )
+    logger.info(
+        "blocking process completed executable=%s elapsed_seconds=%.1f stdout_bytes=%s",
+        args[0] if args else "unknown",
+        time.monotonic() - started_at,
+        len(completed.stdout),
+    )
+    return completed.stdout.decode(errors="replace")
 
 
 async def run_process(
@@ -43,6 +96,21 @@ async def run_process(
             "O servidor não possui todas as ferramentas necessárias para gerar áudio e vídeo. "
             "Peça ao administrador para instalar eSpeak NG e FFmpeg.",
         ) from exc
+    except NotImplementedError:
+        # Uvicorn uses a SelectorEventLoop for reload/multi-process mode on Windows.
+        # It cannot create subprocess transports, so execute FFmpeg/eSpeak in a
+        # worker thread without blocking the API event loop.
+        logger.warning(
+            "event loop has no subprocess support; using threaded fallback executable=%s",
+            args[0] if args else "unknown",
+        )
+        return await asyncio.to_thread(
+            _run_process_blocking,
+            args,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            command_summary=command_summary,
+        )
     try:
         stdout, stderr = await asyncio.wait_for(
             process.communicate(),

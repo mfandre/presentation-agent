@@ -58,6 +58,16 @@ class DoubleStep:
         return {"value": int(inputs["value"]) * 2}
 
 
+class MarkerStep:
+    async def execute(
+        self,
+        inputs: dict[str, Any],
+        config: dict[str, Any],
+        context: ExecutionContext,
+    ) -> dict[str, Any]:
+        return {"branch": config["branch"]}
+
+
 def _definition() -> WorkflowDefinition:
     return WorkflowDefinition.model_validate(
         {
@@ -98,7 +108,7 @@ def _definition() -> WorkflowDefinition:
 def test_default_workflow_yaml_is_valid() -> None:
     definition = WorkflowLoader(Path("workflows")).load("presentation-video")
 
-    assert definition.version == "2.4.0"
+    assert definition.version == "2.6.0"
     assert [step.id for step in definition.steps] == [
         "ingest",
         "narrative",
@@ -107,11 +117,16 @@ def test_default_workflow_yaml_is_valid() -> None:
         "speech",
         "scene_plan",
         "visual_plan",
+        "instructional_design",
+        "whiteboard_concept_plan",
         "prompt_compile",
         "rule_validate",
         "generate_images",
+        "whiteboard_master",
+        "whiteboard_states",
         "visual_review",
         "animate",
+        "whiteboard_animate",
         "visual_qa",
         "render",
         "assemble",
@@ -125,6 +140,9 @@ def test_default_workflow_yaml_is_valid() -> None:
     assert configs["narrative"]["model"] == "openai/gpt-5.6-terra"
     assert configs["narrative"]["secrets"]["api_token"] == "REPLICATE_API_TOKEN"
     assert configs["generate_images"]["model_input"]["aspect_ratio"] == "1536x1024"
+    assert configs["whiteboard_master"]["lock_final_composition"] is True
+    assert configs["whiteboard_states"]["cumulative"] is True
+    assert configs["instructional_design"]["allow_generated_readable_text"] is False
     assert configs["speech"]["voice"] == "Kore"
     assert configs["scene_plan"]["informational_scenes"]["preserve_as_static"] is True
     assert configs["duration_validate"]["tolerance_percent"] == 5
@@ -210,6 +228,54 @@ async def test_executor_retries_pauses_and_resumes_foreach(tmp_path: Path) -> No
     assert completed.run.status == RunStatus.COMPLETED
     doubled = next(step for step in completed.steps if step.step_id == "double")
     assert doubled.outputs == {"items": [{"value": 4}, {"value": 10}]}
+
+
+@pytest.mark.asyncio
+async def test_executor_selects_conditional_branch_from_workflow_input(
+    tmp_path: Path,
+) -> None:
+    definition = WorkflowDefinition.model_validate(
+        {
+            "id": "conditional-flow",
+            "version": "1.0.0",
+            "inputs": {"production_mode": {"type": "string", "required": True}},
+            "steps": [
+                {
+                    "id": "whiteboard",
+                    "uses": "test.marker",
+                    "config": {"branch": "whiteboard"},
+                    "when": {
+                        "input": "production_mode",
+                        "equals": "whiteboard_explainer",
+                    },
+                },
+                {
+                    "id": "standard",
+                    "uses": "test.marker",
+                    "config": {"branch": "standard"},
+                    "when": {
+                        "input": "production_mode",
+                        "not_equals": "whiteboard_explainer",
+                    },
+                },
+            ],
+        }
+    )
+    repository = SQLiteWorkflowStateRepository(tmp_path / "state.db")
+    registry = StepRegistry()
+    registry.register("test.marker", MarkerStep())
+
+    snapshot = await WorkflowExecutor(registry, repository).start(
+        definition,
+        "conditional-run",
+        {"production_mode": "whiteboard_explainer"},
+    )
+
+    statuses = {step.step_id: step.status for step in snapshot.steps}
+    assert statuses == {
+        "whiteboard": StepStatus.COMPLETED,
+        "standard": StepStatus.SKIPPED,
+    }
 
 
 def test_workflow_rejects_cycles() -> None:

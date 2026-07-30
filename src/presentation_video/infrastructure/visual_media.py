@@ -21,6 +21,17 @@ from presentation_video.infrastructure.concept_grounding import (
 logger = logging.getLogger(__name__)
 
 
+def _visible_language_guard(plan: VisualScenePlan) -> str:
+    language = plan.content_language.strip() or "und"
+    return (
+        f"The requested visible-content language is {language}. The production instructions may "
+        "be written in English, but English is not visible content. This scene must be completely "
+        "text-free: render no word, letter, digit, subtitle, label, sign, or pseudo-text in any "
+        f"language. If an unavoidable textual mark appears despite this rule, it must be correctly "
+        f"spelled in {language}; never default to English. "
+    )
+
+
 def _artifact_stem(scene_number: int, shot_number: int) -> str:
     base = f"scene-{scene_number:03d}"
     return base if shot_number == 1 else f"{base}-shot-{shot_number:03d}"
@@ -71,8 +82,27 @@ def _visual_prompt(plan: VisualScenePlan, source_slides: list[SlideContent] | No
         )
     if plan.forbidden_substitutions:
         narrative_contract += f"Do not substitute with: {'; '.join(plan.forbidden_substitutions)}. "
+    if "whiteboard animation" in plan.visual_style.lower():
+        return (
+            "Create the clean final frame of an educational whiteboard animation. "
+            f"{_visible_language_guard(plan)}"
+            f"Scene request: {plan.prompt}. {concept_contract}{narrative_contract}"
+            f"Drawing action: {plan.focal_action}. Entrance: {plan.entrance_motion}. "
+            f"Exit continuity: {plan.transition_out}. Style: {plan.visual_style}.{source_context} "
+            "Keep a pure white background and crisp black marker line art. Use simple doodles, "
+            "icons, arrows, comparisons, timelines, charts, and explanatory diagrams only when "
+            "they directly teach the cited source concepts. Use one coherent composition with "
+            "ample whitespace. The final image must look hand-sketched, not photographic. "
+            "Strictly forbid handwriting and all text-like marks: no words, letters, digits, "
+            "alphabetic characters, typography, glyphs, labels, titles, captions, legends, axis "
+            "labels, annotations, logos, or watermarks. Charts and diagrams must be completely "
+            "unlabeled. Express meaning only through recognizable symbols, shapes, scale, grouping, "
+            "sequence, arrows, and spatial relationships. "
+            f"{_SAFE_VISUAL_POLICY}Also exclude: {plan.negative_prompt}."
+        )
     return (
         "Create a grounded, plausible real-world image that can become a short moving shot. "
+        f"{_visible_language_guard(plan)}"
         "This is one precise documentary beat, not a montage or a summary of the narration. "
         "Use exactly one location, one primary source-grounded subject, and one observable action. "
         "Do not combine multiple moments, departments, environments, or time periods. "

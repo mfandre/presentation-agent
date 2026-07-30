@@ -44,7 +44,7 @@ class WorkflowStepDefinition(BaseModel):
     inputs: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)
     outputs: dict[str, str] = Field(default_factory=dict)
-    when: bool | str = True
+    when: bool | str | dict[str, Any] = True
     foreach: str | None = None
     parallelism: int = Field(default=1, ge=1, le=100)
     retry: RetryPolicy = Field(default_factory=RetryPolicy)

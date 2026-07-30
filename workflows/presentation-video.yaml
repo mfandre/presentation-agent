@@ -1,5 +1,5 @@
 id: presentation-video
-version: 2.4.0
+version: 2.6.0
 description: Produção de vídeo narrado com revisão humana dos visuais.
 
 inputs:
@@ -106,6 +106,9 @@ steps:
   - id: visual_plan
     uses: visuals.direct
     needs: [scene_plan]
+    when:
+      input: production_mode
+      not_equals: whiteboard_explainer
     config:
       provider: replicate
       model: openai/gpt-5.6-luna
@@ -118,9 +121,36 @@ steps:
       attempts: 3
       backoff_seconds: 1
 
+  - id: instructional_design
+    uses: training.classify_and_direct
+    needs: [visual_plan]
+    when:
+      input: production_mode
+      equals: corporate_training
+    config:
+      content_types: [concept, process, rule, behavior, system_demo, recap]
+      exact_information:
+        rule: generated_editorial_still
+        recap: generated_editorial_still
+        system_demo: preserve_source_page
+      generated_take_maximum_seconds: 8
+      allow_generated_readable_text: false
+
+  - id: whiteboard_concept_plan
+    uses: whiteboard.concepts.plan
+    needs: [scene_plan]
+    when:
+      input: production_mode
+      equals: whiteboard_explainer
+    config:
+      layout_direction: left_to_right
+      maximum_take_seconds: 8
+      one_teaching_idea_per_take: true
+      preserve_cumulative_board_state: true
+
   - id: prompt_compile
     uses: prompts.compile
-    needs: [visual_plan]
+    needs: [visual_plan, instructional_design, whiteboard_concept_plan]
     config:
       continuity: locked
       forbid_source_slides_in_cinematic_mode: true
@@ -137,6 +167,9 @@ steps:
   - id: generate_images
     uses: assets.generate
     needs: [rule_validate]
+    when:
+      input: production_mode
+      not_equals: whiteboard_explainer
     parallelism: 3
     config:
       provider: replicate
@@ -157,14 +190,54 @@ steps:
       attempts: 4
       backoff_seconds: 2
 
+  - id: whiteboard_master
+    uses: whiteboard.master.generate
+    needs: [rule_validate]
+    when:
+      input: production_mode
+      equals: whiteboard_explainer
+    parallelism: 3
+    config:
+      provider: replicate
+      model: openai/gpt-image-2
+      layout_direction: left_to_right
+      lock_final_composition: true
+      secrets:
+        api_token: REPLICATE_API_TOKEN
+      model_input:
+        aspect_ratio: 1536x1024
+        quality: auto
+        background: opaque
+        moderation: auto
+        output_format: png
+        number_of_images: 1
+    retry:
+      attempts: 4
+      backoff_seconds: 2
+
+  - id: whiteboard_states
+    uses: whiteboard.states.build
+    needs: [whiteboard_master]
+    when:
+      input: production_mode
+      equals: whiteboard_explainer
+    config:
+      source: locked_master
+      cumulative: true
+      initial_state: blank
+      reveal_order: left_to_right
+
   - id: visual_review
     uses: human.approval
-    needs: [generate_images]
+    needs: [generate_images, whiteboard_states]
     checkpoint: human
 
   - id: animate
     uses: videos.generate
     needs: [visual_review]
+    when:
+      input: production_mode
+      not_equals: whiteboard_explainer
     parallelism: 1
     config:
       provider: replicate
@@ -182,9 +255,35 @@ steps:
       attempts: 3
       backoff_seconds: 2
 
+  - id: whiteboard_animate
+    uses: whiteboard.transitions.generate
+    needs: [visual_review]
+    when:
+      input: production_mode
+      equals: whiteboard_explainer
+    parallelism: 1
+    config:
+      provider: replicate
+      model: google/veo-3.1-lite
+      transition: previous_state_to_approved_end_state
+      preserve_existing_marks: true
+      natural_drawing_speed: true
+      secrets:
+        api_token: REPLICATE_API_TOKEN
+      image_input_key: image
+      model_input:
+        aspect_ratio: "16:9"
+        duration: 8
+        resolution: 1080p
+      poll_interval_seconds: 2
+      timeout_seconds: 900
+    retry:
+      attempts: 3
+      backoff_seconds: 2
+
   - id: visual_qa
     uses: visuals.qa
-    needs: [animate]
+    needs: [animate, whiteboard_animate]
     config:
       verify_duration: true
       verify_non_empty_media: true

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import type { CreateVideoInput, VideoGateway, VideoJob } from "../api/contracts";
+import type { CreateVideoInput, ProductionPreset, VideoGateway, VideoJob } from "../api/contracts";
 import { HttpVideoGateway, HttpVideoGatewayError } from "../api/http-video-gateway";
 
 interface UseVideoCreationResult {
@@ -8,13 +8,17 @@ interface UseVideoCreationResult {
   debugMode: boolean;
   debugMaxScenes: number | null;
   debugReplayJobId: string | null;
+  productionPresets: ProductionPreset[];
   isSubmitting: boolean;
   isActing: boolean;
   error: string | null;
   createVideo(input: CreateVideoInput): Promise<void>;
   regenerateScene(sceneNumber: number, shotNumber: number, prompt: string): Promise<void>;
+  useSourceSlide(sceneNumber: number, shotNumber: number, sourceSlideNumber: number): Promise<void>;
+  generateFromSourceSlide(sceneNumber: number, shotNumber: number, sourceSlideNumber: number, prompt: string): Promise<void>;
   approveVisuals(): Promise<void>;
   decideDuration(decision: "summarize" | "accept" | "cancel"): Promise<void>;
+  cancelVideo(): Promise<void>;
   resumeVideo(jobId?: string): Promise<void>;
   reset(): void;
   assetUrl(path: string): string;
@@ -62,6 +66,7 @@ export function useVideoCreation(
   const [debugMode, setDebugMode] = useState(false);
   const [debugMaxScenes, setDebugMaxScenes] = useState<number | null>(null);
   const [debugReplayJobId, setDebugReplayJobId] = useState<string | null>(null);
+  const [productionPresets, setProductionPresets] = useState<ProductionPreset[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isActing, setIsActing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -76,6 +81,16 @@ export function useVideoCreation(
       setDebugReplayJobId(config.debug_replay_job_id);
     }).catch(() => {
       // Job responses still carry debug_mode, so a transient config failure is non-blocking.
+    });
+    return () => { cancelled = true; };
+  }, [gateway]);
+
+  useEffect(() => {
+    let cancelled = false;
+    gateway.getProductionPresets().then((presets) => {
+      if (!cancelled) setProductionPresets(presets);
+    }).catch(() => {
+      // Preset discovery is non-blocking; the form keeps compatibility fallbacks.
     });
     return () => { cancelled = true; };
   }, [gateway]);
@@ -164,6 +179,34 @@ export function useVideoCreation(
     }
   }, [gateway, job]);
 
+  const useSourceSlide = useCallback(async (sceneNumber: number, shotNumber: number, sourceSlideNumber: number) => {
+    if (!job) return;
+    setIsActing(true);
+    setError(null);
+    try {
+      setJob(await gateway.useSourceSlide(job.job_id, sceneNumber, shotNumber, sourceSlideNumber));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Não foi possível usar o slide selecionado.");
+    } finally {
+      setIsActing(false);
+    }
+  }, [gateway, job]);
+
+  const generateFromSourceSlide = useCallback(async (sceneNumber: number, shotNumber: number, sourceSlideNumber: number, prompt: string) => {
+    if (!job) return;
+    setIsActing(true);
+    setError(null);
+    setJob((current) => current ? { ...current, regenerating_scene_numbers: [sceneNumber] } : current);
+    try {
+      setJob(await gateway.generateFromSourceSlide(job.job_id, sceneNumber, shotNumber, sourceSlideNumber, prompt));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Não foi possível gerar a imagem a partir do slide.");
+    } finally {
+      setIsActing(false);
+      setJob((current) => current ? { ...current, regenerating_scene_numbers: [] } : current);
+    }
+  }, [gateway, job]);
+
   const approveVisuals = useCallback(async () => {
     if (!job) return;
     setIsActing(true);
@@ -191,7 +234,8 @@ export function useVideoCreation(
   }, [gateway, job]);
 
   const resumeVideo = useCallback(async (jobId?: string) => {
-    const targetJobId = (jobId ?? job?.job_id ?? "").trim().toLowerCase();
+    const requestedJobId = typeof jobId === "string" ? jobId : job?.job_id ?? "";
+    const targetJobId = requestedJobId.trim().toLowerCase();
     if (!targetJobId) return;
     setIsActing(true);
     setError(null);
@@ -199,6 +243,19 @@ export function useVideoCreation(
       setJob(await gateway.resumeVideo(targetJobId));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Não foi possível retomar o vídeo.");
+    } finally {
+      setIsActing(false);
+    }
+  }, [gateway, job]);
+
+  const cancelVideo = useCallback(async () => {
+    if (!job || POLLING_STOP_STATUSES.has(job.status)) return;
+    setIsActing(true);
+    setError(null);
+    try {
+      setJob(await gateway.cancelVideo(job.job_id));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Não foi possível cancelar o vídeo.");
     } finally {
       setIsActing(false);
     }
@@ -217,13 +274,17 @@ export function useVideoCreation(
     debugMode: debugMode || Boolean(job?.debug_mode),
     debugMaxScenes,
     debugReplayJobId,
+    productionPresets,
     isSubmitting,
     isActing,
     error,
     createVideo,
     regenerateScene,
+    useSourceSlide,
+    generateFromSourceSlide,
     approveVisuals,
     decideDuration,
+    cancelVideo,
     resumeVideo,
     reset,
     assetUrl: (path: string) => gateway.assetUrl(path),

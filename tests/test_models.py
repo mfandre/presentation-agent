@@ -1,4 +1,10 @@
-from presentation_video.domain.models import PresentationScript, SceneScript
+from presentation_video.domain.models import (
+    MotionPreset,
+    PresentationScript,
+    SceneScript,
+    VisualBeatKind,
+    build_default_visual_beats,
+)
 
 
 def test_total_duration_is_recalculated() -> None:
@@ -55,3 +61,42 @@ def test_script_supports_api_maximum_duration() -> None:
     )
 
     assert script.total_estimated_seconds == 1800
+
+
+def test_generated_static_scene_default_beat_does_not_fall_back_to_source_slide() -> None:
+    beats = build_default_visual_beats(
+        20,
+        is_video=False,
+        motion_preset=MotionPreset.NONE,
+        allow_source_slide=False,
+    )
+
+    assert len(beats) == 1
+    assert beats[0].kind == VisualBeatKind.GENERATED_IMAGE
+
+
+def test_preserved_hybrid_static_scene_keeps_source_slide_beat() -> None:
+    beats = build_default_visual_beats(
+        20,
+        is_video=False,
+        motion_preset=MotionPreset.NONE,
+        allow_source_slide=True,
+    )
+
+    assert len(beats) == 1
+    assert beats[0].kind == VisualBeatKind.SOURCE_SLIDE
+
+
+def test_hybrid_video_can_return_to_source_slide_when_explicitly_allowed() -> None:
+    beats = build_default_visual_beats(
+        30,
+        is_video=True,
+        motion_preset=MotionPreset.SLOW_PUSH,
+        allow_source_slide=True,
+    )
+
+    assert [beat.kind for beat in beats] == [
+        VisualBeatKind.GENERATED_VIDEO,
+        VisualBeatKind.GENERATED_IMAGE,
+        VisualBeatKind.SOURCE_SLIDE,
+    ]

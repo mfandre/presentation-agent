@@ -24,7 +24,11 @@ from presentation_video.domain.models import (
     VisualScenePlan,
 )
 from presentation_video.infrastructure.speech import _delivery_prompt
-from presentation_video.infrastructure.visual_media import _artifact_stem, _visual_prompt
+from presentation_video.infrastructure.visual_media import (
+    _artifact_stem,
+    _visible_language_guard,
+    _visual_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -260,23 +264,54 @@ class VertexVideoAssetGenerator:
         if not image.path.is_file() or image.path.stat().st_size == 0:
             raise ValueError(f"Approved image does not exist or is empty: {image.path}")
 
-        mime_type = mimetypes.guess_type(image.path.name)[0] or "image/png"
+        first_frame_path = image.start_path or image.path
+        if not first_frame_path.is_file() or first_frame_path.stat().st_size == 0:
+            raise ValueError(f"First frame does not exist or is empty: {first_frame_path}")
+        mime_type = mimetypes.guess_type(first_frame_path.name)[0] or "image/png"
         source_image = types.Image(
-            image_bytes=image.path.read_bytes(),
+            image_bytes=first_frame_path.read_bytes(),
             mime_type=mime_type,
         )
-        prompt = (
-            "Animate the supplied approved image into a short, coherent documentary shot. "
-            "Preserve the identity, appearance, position, proportions, and relationships of all "
-            "subjects and objects. Use subtle natural subject motion and restrained camera motion "
-            f"at normal speed. Camera direction: {plan.camera_motion.strip()}. "
-            f"Entrance: {plan.entrance_motion}. Focal action: {plan.focal_action}. "
-            f"End by {plan.transition_out}. Apply that direction "
-            "only as camera or subject motion; do not turn it into a new object or concept. "
-            "Do not morph objects, invent interfaces, or add new visual concepts. "
-            "The clip must contain absolutely no words, letters, numbers, captions, subtitles, "
-            "logos, signs, documents, screens, user interfaces, charts, tables, or watermarks."
+        last_frame = (
+            types.Image(
+                image_bytes=image.path.read_bytes(),
+                mime_type=mimetypes.guess_type(image.path.name)[0] or "image/png",
+            )
+            if image.start_path is not None
+            else None
         )
+        if "whiteboard animation" in plan.visual_style.lower():
+            prompt = (
+                "Mechanical tracing task, not a creative drawing task. Locked overhead camera. "
+                f"{_visible_language_guard(plan)}"
+                "Pure white board. Show exactly one natural human hand holding exactly one plain "
+                "black felt-tip marker. The first supplied image is the exact first frame. The "
+                "last supplied image is the exact final frame and the complete tracing template. "
+                "Move the hand at a calm, readable speed. Keep the marker tip touching the board "
+                "and reveal only the missing black strokes from the final template. Trace those "
+                "strokes exactly at their final coordinates, with their final shape and thickness. "
+                "Do not interpret the subject. Do not improvise, embellish, complete, replace, "
+                "simplify, decorate, preview, or invent any line or object. Do not draw from the "
+                "narration. Preserve every line already visible in the first frame without "
+                "redrawing, erasing, moving, or changing it. Pixels that are white in the final "
+                "frame must remain white for the whole video. After completing the permitted "
+                "strokes, hold briefly on the exact final frame. No camera motion, zoom, pan, "
+                "cuts, transitions, color, text, handwriting, or animation of existing objects."
+            )
+        else:
+            prompt = (
+                "Animate the supplied approved image into a short, coherent documentary shot. "
+                f"{_visible_language_guard(plan)}"
+                "Preserve the identity, appearance, position, proportions, and relationships of all "
+                "subjects and objects. Use subtle natural subject motion and restrained camera motion "
+                f"at normal speed. Camera direction: {plan.camera_motion.strip()}. "
+                f"Entrance: {plan.entrance_motion}. Focal action: {plan.focal_action}. "
+                f"End by {plan.transition_out}. Apply that direction "
+                "only as camera or subject motion; do not turn it into a new object or concept. "
+                "Do not morph objects, invent interfaces, or add new visual concepts. "
+                "The clip must contain absolutely no words, letters, numbers, captions, subtitles, "
+                "logos, signs, documents, screens, user interfaces, charts, tables, or watermarks."
+            )
         scene_output_uri = None
         if self._output_gcs_uri:
             request_id = self._request_id_factory().strip()
@@ -292,11 +327,15 @@ class VertexVideoAssetGenerator:
             duration_seconds=self._clip_duration_seconds,
             aspect_ratio=self._aspect_ratio,
             resolution=self._resolution,
+            last_frame=last_frame,
             generate_audio=False,
             negative_prompt=(
                 "text, words, letters, numbers, captions, subtitles, logos, signage, documents, "
                 "screens, interfaces, dashboards, charts, tables, watermarks, distorted objects, "
-                "morphing, flicker, slow motion"
+                "morphing, flicker, slow motion, future elements, premature elements, "
+                "foreshadowing, transient extra strokes, objects absent from the final frame, "
+                "creative interpretation, improvised drawing, colored ink, multiple hands, "
+                "multiple markers, floating marker, camera motion, animated existing drawings"
             ),
         )
         started_at = time.monotonic()

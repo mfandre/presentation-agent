@@ -14,7 +14,12 @@ export function ErrorPanel({ message, onReset, onResume, isActing = false }: Err
       <h2>Não foi possível criar o vídeo</h2>
       <p>{message}</p>
       {onResume && (
-        <button type="button" className="primary-button" disabled={isActing} onClick={onResume}>
+        <button
+          type="button"
+          className="primary-button"
+          disabled={isActing}
+          onClick={() => onResume()}
+        >
           <RotateCcw size={17} /> {isActing ? "Retomando…" : "Retomar processamento"}
         </button>
       )}

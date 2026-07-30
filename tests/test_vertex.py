@@ -349,9 +349,69 @@ async def test_video_generator_polls_veo_and_downloads_gcs_result(
     assert config.aspect_ratio == "16:9"
     assert config.resolution == "720p"
     assert config.generate_audio is False
+    assert config.last_frame is None
     assert config.output_gcs_uri == "gs://video-results/jobs/scene-003-r2-test-request"
     assert storage.bucket_names == ["video-results"]
     assert bucket.object_names == ["jobs/scene-003/output-0.mp4"]
+
+
+@pytest.mark.asyncio
+async def test_video_generator_interpolates_whiteboard_first_and_last_frames(
+    tmp_path: Path,
+) -> None:
+    video = SimpleNamespace(uri=None, video_bytes=b"whiteboard-transition")
+    completed = SimpleNamespace(
+        name="projects/p/locations/us-central1/operations/whiteboard",
+        done=True,
+        metadata=None,
+        error=None,
+        result=SimpleNamespace(
+            generated_videos=[SimpleNamespace(video=video)],
+            rai_media_filtered_reasons=None,
+        ),
+        response=None,
+    )
+    models = FakeVideoModels(completed)
+    first_frame = tmp_path / "state-001.png"
+    last_frame = tmp_path / "state-002.png"
+    first_frame.write_bytes(b"\x89PNG\r\nfirst-state")
+    last_frame.write_bytes(b"\x89PNG\r\nlast-state")
+    generator = VertexVideoAssetGenerator(
+        SimpleNamespace(models=models),
+        output_gcs_uri=None,
+        poll_interval_seconds=0,
+        timeout_seconds=1,
+        max_retries=0,
+        retry_backoff_seconds=0,
+    )
+    plan = _video_plan().model_copy(
+        update={
+            "visual_style": "Classic educational whiteboard animation",
+            "content_language": "pt-BR",
+        }
+    )
+
+    await generator.animate(
+        plan,
+        VisualArtifact(
+            scene_number=1,
+            shot_number=2,
+            start_path=first_frame,
+            path=last_frame,
+            kind="image",
+        ),
+        tmp_path / "clips",
+        duration_seconds=8,
+    )
+
+    call = models.calls[0]
+    assert call["image"].image_bytes == first_frame.read_bytes()
+    assert call["config"].last_frame.image_bytes == last_frame.read_bytes()
+    assert "Mechanical tracing task" in call["prompt"]
+    assert "exactly one natural human hand" in call["prompt"]
+    assert "Do not improvise" in call["prompt"]
+    assert "requested visible-content language is pt-BR" in call["prompt"]
+    assert "never default to English" in call["prompt"]
 
 
 @pytest.mark.asyncio

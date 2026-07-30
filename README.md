@@ -448,3 +448,14 @@ persistido. Após reiniciar o backend, `GET /v1/videos/{job_id}` recupera o esta
 Para PostgreSQL, implemente `WorkflowStateRepository` com o driver/ORM escolhido e selecione o
 adapter no bootstrap. O executor e os steps não dependem de SQLite; não é necessário alterar o
 workflow YAML nem mover os artefatos para o banco.
+
+
+## Login Gcloud
+
+gcloud auth login
+
+gcloud config set project SEU_PROJECT_ID
+
+gcloud auth application-default login
+
+gcloud auth application-default set-quota-project SEU_PROJECT_ID

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -21,8 +22,16 @@ from pydantic import BaseModel, Field
 
 from presentation_video.bootstrap import build_pipeline
 from presentation_video.application.captions import build_caption_cues, write_caption_files
+from presentation_video.application.production_presets import (
+    ProductionPreset,
+    get_production_preset,
+    list_production_presets,
+    validate_preset_plan,
+)
 from presentation_video.domain.errors import DurationReviewRequired, UserFacingError
 from presentation_video.domain.models import (
+    BrandAssetKind,
+    BrandKit,
     CreativeDirection,
     JobStatus,
     MediaMode,
@@ -35,6 +44,7 @@ from presentation_video.domain.models import (
     VisualBeat,
     PresentationVisualPlan,
 )
+from presentation_video.infrastructure.brand_kit import FileBrandKitRepository
 from presentation_video.infrastructure.reporting import (
     CallbackJobReporter,
     CompositeJobReporter,
@@ -59,6 +69,7 @@ workflow_state_repository = SQLiteWorkflowStateRepository(
     sqlite_path_from_url(settings.workflow_database_url)
 )
 workflow_tracker = WorkflowJobTracker(workflow_state_repository, workflow_definition)
+brand_kit_repository = FileBrandKitRepository(settings.work_root / "brand")
 app = FastAPI(title="Presentation Video AI", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
@@ -97,10 +108,52 @@ class SceneImageView(BaseModel):
     forbidden_substitutions: list[str] = Field(default_factory=list)
     source_slide_number: int | None = None
     preserve_source_frame: bool = True
+    instructional_type: str | None = None
+    learning_objective: str = ""
+    allow_readable_text: bool = False
 
 
 class RegenerateSceneRequest(BaseModel):
     prompt: str | None = Field(default=None, min_length=3, max_length=4_000)
+
+
+class SourceSlideSelectionRequest(BaseModel):
+    source_slide_number: int = Field(ge=1)
+    prompt: str | None = Field(default=None, min_length=3, max_length=4_000)
+
+
+class BrandKitView(BaseModel):
+    name: str
+    version: int
+    primary_color: str
+    secondary_color: str
+    accent_color: str
+    background_color: str
+    heading_font: str
+    body_font: str
+    visual_style: str
+    image_text_policy: str
+    logo_url: str | None = None
+    opening_image_url: str | None = None
+    closing_image_url: str | None = None
+
+
+class BrandKitUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    primary_color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+    secondary_color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+    accent_color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+    background_color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+    heading_font: str = Field(min_length=1, max_length=80)
+    body_font: str = Field(min_length=1, max_length=80)
+    visual_style: str = Field(min_length=1, max_length=500)
+    image_text_policy: Literal["avoid", "minimal", "allowed"] = "avoid"
+
+
+class SourcePageView(BaseModel):
+    number: int
+    title: str
+    image_url: str
 
 
 class DurationDecisionRequest(BaseModel):
@@ -127,6 +180,7 @@ class JobView(BaseModel):
     audience: str
     tone: str
     production_mode: ProductionMode = ProductionMode.HYBRID_PRESENTATION
+    preset_options: dict[str, str] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
     start_datetime: datetime
@@ -141,6 +195,8 @@ class JobView(BaseModel):
     regenerating_scene_numbers: list[int] = Field(default_factory=list)
     debug_mode: bool = False
     creative_direction: CreativeDirection | None = None
+    brand_kit: BrandKitView | None = None
+    source_pages: list[SourcePageView] = Field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -169,6 +225,21 @@ _jobs_lock = asyncio.Lock()
 _upload_root = settings.work_root / "uploads"
 _upload_root.mkdir(parents=True, exist_ok=True)
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+_MAX_BRAND_ASSET_BYTES = 15 * 1024 * 1024
+
+
+def _brand_kit_view(kit: BrandKit) -> BrandKitView:
+    def url(kind: BrandAssetKind, path: Path | None) -> str | None:
+        return f"/v1/brand-kit/assets/{kind.value}" if path and path.is_file() else None
+
+    return BrandKitView(
+        **kit.model_dump(
+            exclude={"logo_path", "opening_image_path", "closing_image_path"}
+        ),
+        logo_url=url(BrandAssetKind.LOGO, kit.logo_path),
+        opening_image_url=url(BrandAssetKind.OPENING_IMAGE, kit.opening_image_path),
+        closing_image_url=url(BrandAssetKind.CLOSING_IMAGE, kit.closing_image_path),
+    )
 
 _STAGE_PROGRESS: dict[JobStatus, tuple[int, int]] = {
     JobStatus.RECEIVED: (0, 0),
@@ -201,12 +272,17 @@ _WORKFLOW_STEP_TO_JOB_STATUS: dict[str, JobStatus] = {
     "duration_review": JobStatus.AWAITING_DURATION_APPROVAL,
     "scene_plan": JobStatus.SCENE_PLANNING,
     "visual_plan": JobStatus.VISUAL_PLANNING,
+    "instructional_design": JobStatus.VISUAL_PLANNING,
+    "whiteboard_concept_plan": JobStatus.VISUAL_PLANNING,
     "prompt_compile": JobStatus.PROMPT_COMPILING,
     "rule_validate": JobStatus.RULE_VALIDATING,
     "generate_images": JobStatus.GENERATING_IMAGES,
+    "whiteboard_master": JobStatus.GENERATING_IMAGES,
+    "whiteboard_states": JobStatus.GENERATING_IMAGES,
     "visual_review": JobStatus.AWAITING_VISUAL_APPROVAL,
     "speech": JobStatus.SYNTHESIZING,
     "animate": JobStatus.GENERATING_VIDEO,
+    "whiteboard_animate": JobStatus.GENERATING_VIDEO,
     "visual_qa": JobStatus.VISUAL_QA,
     "render": JobStatus.RENDERING,
     "assemble": JobStatus.ASSEMBLING,
@@ -274,6 +350,7 @@ def _recover_completed_job(
         production_mode=ProductionMode(
             manifest.get("production_mode") or ProductionMode.HYBRID_PRESENTATION.value
         ),
+        preset_options=dict(manifest.get("preset_options") or {}),
         created_at=timestamp,
         updated_at=timestamp,
         start_datetime=start_datetime,
@@ -375,6 +452,7 @@ def _recover_workflow_job(job_id: str) -> JobRecord | None:
             production_mode=ProductionMode(
                 inputs.get("production_mode") or ProductionMode.HYBRID_PRESENTATION.value
             ),
+            preset_options=dict(inputs.get("preset_options") or {}),
             created_at=created_at,
             updated_at=snapshot.run.updated_at,
             start_datetime=snapshot.run.start_datetime,
@@ -498,6 +576,17 @@ def _scene_image_views(prepared: PreparedVideoJob) -> list[SceneImageView]:
     )
 
 
+def _source_page_views(prepared: PreparedVideoJob) -> list[SourcePageView]:
+    return [
+        SourcePageView(
+            number=slide.number,
+            title=slide.title or f"Página {slide.number}",
+            image_url=f"/v1/videos/{prepared.job_id}/source-pages/{slide.number}/image",
+        )
+        for slide in prepared.document.slides
+    ]
+
+
 def _scene_image_views_from_assets(
     job_id: str,
     visual_plan: PresentationVisualPlan,
@@ -544,6 +633,11 @@ def _scene_image_views_from_assets(
                 forbidden_substitutions=plan.forbidden_substitutions,
                 source_slide_number=plan.source_slide_number,
                 preserve_source_frame=plan.preserve_source_frame,
+                instructional_type=(
+                    plan.instructional_type.value if plan.instructional_type else None
+                ),
+                learning_objective=plan.learning_objective,
+                allow_readable_text=plan.allow_readable_text,
             )
         )
     return views
@@ -788,7 +882,10 @@ async def _prepare_job(
             record.view.script_url = f"/v1/videos/{job_id}/script"
             record.view.visual_plan_url = f"/v1/videos/{job_id}/visual-plan"
             record.view.scene_images = _scene_image_views(prepared)
+            record.view.source_pages = _source_page_views(prepared)
             record.view.creative_direction = prepared.script.creative_direction
+            if prepared.request.brand_kit is not None:
+                record.view.brand_kit = _brand_kit_view(prepared.request.brand_kit)
             record.view.target_seconds = prepared.request.target_seconds
             record.view.status = JobStatus.AWAITING_VISUAL_APPROVAL
             record.view.progress_percent = 55
@@ -884,6 +981,52 @@ async def runtime_config() -> RuntimeConfigView:
     )
 
 
+@app.get("/v1/brand-kit", response_model=BrandKitView)
+async def get_brand_kit() -> BrandKitView:
+    return _brand_kit_view(brand_kit_repository.get())
+
+
+@app.put("/v1/brand-kit", response_model=BrandKitView)
+async def update_brand_kit(payload: BrandKitUpdate) -> BrandKitView:
+    current = brand_kit_repository.get()
+    updated = brand_kit_repository.update(
+        current.model_copy(update=payload.model_dump())
+    )
+    return _brand_kit_view(updated)
+
+
+@app.post("/v1/brand-kit/assets/{kind}", response_model=BrandKitView)
+async def upload_brand_asset(
+    kind: BrandAssetKind,
+    file: UploadFile = File(...),
+) -> BrandKitView:
+    suffix = Path(file.filename or "").suffix.lower()
+    allowed = {".png", ".jpg", ".jpeg", ".webp", ".svg"}
+    if suffix not in allowed:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Brand assets must use one of: {sorted(allowed)}",
+        )
+    content = await file.read(_MAX_BRAND_ASSET_BYTES + 1)
+    await file.close()
+    if len(content) > _MAX_BRAND_ASSET_BYTES:
+        raise HTTPException(status_code=413, detail="Brand asset exceeds 15 MB")
+    return _brand_kit_view(brand_kit_repository.save_asset(kind, content, suffix))
+
+
+@app.get("/v1/brand-kit/assets/{kind}")
+async def get_brand_asset(kind: BrandAssetKind) -> FileResponse:
+    path = brand_kit_repository.asset_path(kind)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="Brand asset not found")
+    return FileResponse(path)
+
+
+@app.get("/v1/production-presets", response_model=list[ProductionPreset])
+async def production_presets() -> list[ProductionPreset]:
+    return list_production_presets()
+
+
 @app.get("/v1/workflows", response_model=list[WorkflowDefinition])
 async def list_workflows() -> list[WorkflowDefinition]:
     return workflow_loader.list()
@@ -905,7 +1048,39 @@ async def create_video(
     audience: str = Form(default="executive"),
     tone: str = Form(default="professional and natural"),
     production_mode: ProductionMode = Form(default=ProductionMode.HYBRID_PRESENTATION),
+    preset_options: str = Form(default="{}"),
 ) -> JobView:
+    try:
+        parsed_preset_options = json.loads(preset_options)
+        if not isinstance(parsed_preset_options, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in parsed_preset_options.items()
+        ):
+            raise ValueError
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="preset_options must be a JSON object containing string values",
+        ) from None
+    preset = get_production_preset(production_mode)
+    allowed_options = {option.id: option for option in preset.options}
+    unknown_options = sorted(set(parsed_preset_options) - set(allowed_options))
+    if unknown_options:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown options for {production_mode.value}: {unknown_options}",
+        )
+    normalized_preset_options = {
+        option.id: parsed_preset_options.get(option.id, option.default)
+        for option in preset.options
+    }
+    for option in preset.options:
+        allowed_values = {choice.value for choice in option.choices}
+        if normalized_preset_options[option.id] not in allowed_values:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid value for preset option {option.id}",
+            )
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".pptx", ".pdf"}:
         raise HTTPException(status_code=415, detail="Only .pptx and .pdf files are accepted")
@@ -929,6 +1104,7 @@ async def create_video(
         await file.close()
 
     now = datetime.now(UTC)
+    brand_snapshot = brand_kit_repository.get().model_copy(deep=True)
     view = JobView(
         job_id=job_id,
         status=JobStatus.RECEIVED,
@@ -941,9 +1117,11 @@ async def create_video(
         audience=audience,
         tone=tone,
         production_mode=production_mode,
+        preset_options=normalized_preset_options,
         created_at=now,
         updated_at=now,
         start_datetime=now,
+        brand_kit=_brand_kit_view(brand_snapshot),
     )
     async with _jobs_lock:
         _jobs[job_id] = JobRecord(view=view, source_path=source_path)
@@ -955,6 +1133,8 @@ async def create_video(
         audience=audience,
         tone=tone,
         production_mode=production_mode,
+        preset_options=normalized_preset_options,
+        brand_kit=brand_snapshot,
     )
     workflow_tracker.initialize(
         job_id,
@@ -965,6 +1145,8 @@ async def create_video(
             "audience": audience,
             "tone": tone,
             "production_mode": production_mode.value,
+            "preset_options": normalized_preset_options,
+            "brand_kit": brand_snapshot.model_dump(mode="json"),
         },
     )
     metadata_path = _request_metadata_path(job_id)
@@ -1005,6 +1187,43 @@ async def get_video(job_id: str) -> JobView:
                 raise HTTPException(status_code=404, detail="Job not found")
             _jobs[job_id] = record
         return record.view.model_copy(deep=True)
+
+
+@app.post("/v1/videos/{job_id}/cancel", response_model=JobView, status_code=202)
+async def cancel_video(job_id: str) -> JobView:
+    async with _jobs_lock:
+        record = _jobs.get(job_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if record.view.status == JobStatus.CANCELLED:
+            return record.view.model_copy(deep=True)
+        if record.view.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job cannot be cancelled from status {record.view.status.value}",
+            )
+        task = record.active_task
+        record.active_task = None
+        record.debug_duration_event.set()
+        record.debug_visual_event.set()
+        now = datetime.now(UTC)
+        record.view.status = JobStatus.CANCELLED
+        record.view.detail = "Processamento cancelado pelo usuário"
+        record.view.updated_at = now
+        record.view.end_datetime = now
+        view = record.view.model_copy(deep=True)
+
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    await workflow_tracker.update(
+        job_id,
+        JobStatus.CANCELLED,
+        "Processamento cancelado pelo usuário",
+    )
+    logger.info("job=%s cancelled by user", job_id)
+    return view
 
 
 @app.post("/v1/videos/{job_id}/duration-decision", response_model=JobView, status_code=202)
@@ -1087,6 +1306,30 @@ async def get_scene_image(job_id: str, scene_number: int) -> FileResponse:
     return await get_shot_image(job_id, scene_number, 1)
 
 
+@app.get("/v1/videos/{job_id}/source-pages/{source_slide_number}/image")
+async def get_source_page_image(
+    job_id: str,
+    source_slide_number: int,
+) -> FileResponse:
+    async with _jobs_lock:
+        record = _jobs.get(job_id)
+        slide = (
+            next(
+                (
+                    item
+                    for item in record.prepared.document.slides
+                    if item.number == source_slide_number
+                ),
+                None,
+            )
+            if record and record.prepared
+            else None
+        )
+    if slide is None or not slide.image_path.is_file():
+        raise HTTPException(status_code=404, detail="Source page not found")
+    return FileResponse(slide.image_path)
+
+
 @app.get("/v1/videos/{job_id}/scenes/{scene_number}/shots/{shot_number}/image")
 async def get_shot_image(job_id: str, scene_number: int, shot_number: int) -> FileResponse:
     async with _jobs_lock:
@@ -1114,6 +1357,112 @@ async def get_shot_image(job_id: str, scene_number: int, shot_number: int) -> Fi
     if image_path is None or not image_path.exists():
         raise HTTPException(status_code=404, detail="Scene image not found")
     return FileResponse(image_path)
+
+
+@app.post(
+    "/v1/videos/{job_id}/scenes/{scene_number}/use-source-slide",
+    response_model=JobView,
+)
+async def use_source_slide(
+    job_id: str,
+    scene_number: int,
+    payload: SourceSlideSelectionRequest,
+    shot_number: int = 1,
+) -> JobView:
+    async with _jobs_lock:
+        record = _jobs.get(job_id)
+        if (
+            record is None
+            or record.view.status != JobStatus.AWAITING_VISUAL_APPROVAL
+            or record.prepared is None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Source pages can only be selected during visual review",
+            )
+        prepared = record.prepared
+        if prepared.request.production_mode not in {
+            ProductionMode.HYBRID_PRESENTATION,
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail="This visual format does not allow original slides in the final video",
+            )
+        try:
+            pipeline.use_source_slide(
+                prepared,
+                scene_number,
+                shot_number,
+                payload.source_slide_number,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        record.view.scene_images = _scene_image_views(prepared)
+        record.view.updated_at = datetime.now(UTC)
+        return record.view.model_copy(deep=True)
+
+
+@app.post(
+    "/v1/videos/{job_id}/scenes/{scene_number}/generate-from-source-slide",
+    response_model=JobView,
+)
+async def generate_scene_from_source_slide(
+    job_id: str,
+    scene_number: int,
+    payload: SourceSlideSelectionRequest,
+    shot_number: int = 1,
+) -> JobView:
+    async with _jobs_lock:
+        record = _jobs.get(job_id)
+        if (
+            record is None
+            or record.view.status != JobStatus.AWAITING_VISUAL_APPROVAL
+            or record.prepared is None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Images can only be generated during visual review",
+            )
+        if scene_number in record.regenerating_scenes:
+            raise HTTPException(status_code=409, detail="This image is already being generated")
+        record.regenerating_scenes.add(scene_number)
+        record.view.regenerating_scene_numbers = sorted(record.regenerating_scenes)
+        prepared = record.prepared
+        if prepared.request.production_mode == ProductionMode.WHITEBOARD_EXPLAINER:
+            record.regenerating_scenes.discard(scene_number)
+            record.view.regenerating_scene_numbers = []
+            raise HTTPException(
+                status_code=409,
+                detail="Whiteboard scenes must be regenerated as one progressive drawing",
+            )
+    try:
+        await pipeline.generate_image_from_slide(
+            prepared,
+            scene_number,
+            shot_number,
+            payload.source_slide_number,
+            payload.prompt,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Image generation from source page failed: {exc}",
+        ) from exc
+    finally:
+        async with _jobs_lock:
+            current = _jobs.get(job_id)
+            if current is not None:
+                current.regenerating_scenes.discard(scene_number)
+                current.view.regenerating_scene_numbers = sorted(
+                    current.regenerating_scenes
+                )
+    async with _jobs_lock:
+        record = _jobs[job_id]
+        record.view.scene_images = _scene_image_views(prepared)
+        record.view.updated_at = datetime.now(UTC)
+        return record.view.model_copy(deep=True)
 
 
 @app.post("/v1/videos/{job_id}/scenes/{scene_number}/regenerate", response_model=JobView)
@@ -1196,6 +1545,23 @@ async def approve_visuals(job_id: str) -> JobView:
             raise HTTPException(status_code=409, detail="Wait for image regeneration to finish")
         if record.finalization_started:
             raise HTTPException(status_code=409, detail="Video generation has already started")
+        if not is_debug_replay:
+            assert record.prepared is not None
+            try:
+                validate_preset_plan(
+                    record.prepared.request.production_mode,
+                    record.prepared.visual_plan,
+                )
+            except ValueError as exc:
+                record.view.status = JobStatus.FAILED
+                record.view.detail = (
+                    "O storyboard foi criado por uma versão anterior e precisa ser "
+                    "reprocessado. Use “Retomar processamento” para reconstruí-lo."
+                )
+                record.view.updated_at = datetime.now(UTC)
+                record.view.end_datetime = record.view.updated_at
+                logger.warning("job=%s approval rejected invalid preset plan: %s", job_id, exc)
+                raise HTTPException(status_code=409, detail=record.view.detail) from exc
         record.finalization_started = True
         record.view.status = JobStatus.GENERATING_VIDEO
         record.view.detail = "Storyboard aprovado; gerando apenas os takes animáveis"
@@ -1260,12 +1626,26 @@ async def resume_video(job_id: str) -> JobView:
                 "audience": request.audience,
                 "tone": request.tone,
                 "production_mode": request.production_mode.value,
+                "preset_options": request.preset_options,
             },
         )
         output_dir = settings.output_root / job_id
+        preset_artifacts_invalid = False
+        if request.production_mode != ProductionMode.HYBRID_PRESENTATION:
+            try:
+                stored_plan = (
+                    prepared.visual_plan
+                    if prepared is not None
+                    else PresentationVisualPlan.model_validate_json(
+                        (output_dir / "visual-plan.json").read_text(encoding="utf-8")
+                    )
+                )
+                validate_preset_plan(request.production_mode, stored_plan)
+            except (OSError, ValueError):
+                preset_artifacts_invalid = True
         restart_preparation = not (
             (output_dir / "script.json").is_file() and (output_dir / "visual-plan.json").is_file()
-        )
+        ) or preset_artifacts_invalid
         should_finalize = (
             record.finalization_started if record is not None else _finalization_has_started(job_id)
         )
@@ -1308,7 +1688,15 @@ async def resume_video(job_id: str) -> JobView:
         task = asyncio.create_task(_prepare_job(job_id, request))
         async with _jobs_lock:
             _jobs[job_id].active_task = task
-        logger.info("job=%s restarting incomplete preparation", job_id)
+        logger.info(
+            "job=%s restarting preparation incomplete=%s invalid_preset_artifacts=%s",
+            job_id,
+            not (
+                (output_dir / "script.json").is_file()
+                and (output_dir / "visual-plan.json").is_file()
+            ),
+            preset_artifacts_invalid,
+        )
         return view
 
     try:
@@ -1355,7 +1743,10 @@ async def resume_video(job_id: str) -> JobView:
             record.view.script_url = f"/v1/videos/{job_id}/script"
             record.view.visual_plan_url = f"/v1/videos/{job_id}/visual-plan"
             record.view.scene_images = _scene_image_views(prepared)
+            record.view.source_pages = _source_page_views(prepared)
             record.view.creative_direction = prepared.script.creative_direction
+            if prepared.request.brand_kit is not None:
+                record.view.brand_kit = _brand_kit_view(prepared.request.brand_kit)
             record.finalization_started = should_finalize
             view = record.view.model_copy(deep=True)
     except FileNotFoundError as exc:

@@ -32,6 +32,23 @@ _STATUS_TO_STEP: dict[JobStatus, str] = {
 }
 
 
+def _matches_input_condition(condition: object, inputs: dict[str, Any]) -> bool:
+    if isinstance(condition, bool):
+        return condition
+    if not isinstance(condition, dict) or "input" not in condition:
+        return True
+    value = inputs.get(str(condition["input"]))
+    if "equals" in condition:
+        return value == condition["equals"]
+    if "not_equals" in condition:
+        return value != condition["not_equals"]
+    if "in" in condition:
+        return value in condition["in"]
+    if "not_in" in condition:
+        return value not in condition["not_in"]
+    return True
+
+
 class WorkflowJobTracker:
     """Projects legacy pipeline progress into persistent workflow state."""
 
@@ -62,6 +79,13 @@ class WorkflowJobTracker:
                 ),
                 self._definition,
             )
+            for step in self._definition.steps:
+                if not _matches_input_condition(step.when, inputs):
+                    self._repository.set_step_status(
+                        job_id,
+                        step.id,
+                        StepStatus.SKIPPED,
+                    )
         snapshot = self._repository.get(job_id)
         assert snapshot is not None
         return snapshot
@@ -93,6 +117,21 @@ class WorkflowJobTracker:
             return
         order = self._snapshot_order(snapshot)
         step_id = _STATUS_TO_STEP.get(status)
+        production_mode = snapshot.run.inputs.get("production_mode")
+        is_whiteboard = production_mode == "whiteboard_explainer"
+        is_training = production_mode == "corporate_training"
+        if status == JobStatus.VISUAL_PLANNING and is_whiteboard:
+            step_id = "whiteboard_concept_plan"
+        elif status == JobStatus.VISUAL_PLANNING and is_training:
+            step_id = "instructional_design"
+        elif status == JobStatus.GENERATING_IMAGES and is_whiteboard:
+            step_id = (
+                "whiteboard_states"
+                if "whiteboard_states" in detail
+                else "whiteboard_master"
+            )
+        elif status == JobStatus.GENERATING_VIDEO and is_whiteboard:
+            step_id = "whiteboard_animate"
         if step_id is None or step_id not in order:
             return
         target_index = order.index(step_id)

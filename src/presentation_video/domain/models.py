@@ -37,6 +37,46 @@ class MediaMode(StrEnum):
 class ProductionMode(StrEnum):
     HYBRID_PRESENTATION = "hybrid_presentation"
     CINEMATIC_STORY = "cinematic_story"
+    WHITEBOARD_EXPLAINER = "whiteboard_explainer"
+    CORPORATE_TRAINING = "corporate_training"
+
+
+class BrandAssetKind(StrEnum):
+    LOGO = "logo"
+    OPENING_IMAGE = "opening_image"
+    CLOSING_IMAGE = "closing_image"
+
+
+class BrandKit(BaseModel):
+    name: str = Field(default="Identidade principal", min_length=1, max_length=120)
+    version: int = Field(default=1, ge=1)
+    primary_color: str = Field(default="#5424D6", pattern=r"^#[0-9A-Fa-f]{6}$")
+    secondary_color: str = Field(default="#23A877", pattern=r"^#[0-9A-Fa-f]{6}$")
+    accent_color: str = Field(default="#F2A900", pattern=r"^#[0-9A-Fa-f]{6}$")
+    background_color: str = Field(default="#F7F7FB", pattern=r"^#[0-9A-Fa-f]{6}$")
+    heading_font: str = Field(default="Inter", min_length=1, max_length=80)
+    body_font: str = Field(default="Inter", min_length=1, max_length=80)
+    visual_style: str = Field(
+        default="editorial corporativo contemporâneo",
+        min_length=1,
+        max_length=500,
+    )
+    image_text_policy: str = Field(
+        default="avoid",
+        pattern=r"^(avoid|minimal|allowed)$",
+    )
+    logo_path: Path | None = None
+    opening_image_path: Path | None = None
+    closing_image_path: Path | None = None
+
+
+class InstructionalContentType(StrEnum):
+    CONCEPT = "concept"
+    PROCESS = "process"
+    RULE = "rule"
+    BEHAVIOR = "behavior"
+    SYSTEM_DEMO = "system_demo"
+    RECAP = "recap"
 
 
 class MotionPreset(StrEnum):
@@ -97,7 +137,11 @@ def build_default_visual_beats(
         return [
             VisualBeat(
                 beat_number=1,
-                kind=VisualBeatKind.SOURCE_SLIDE,
+                kind=(
+                    VisualBeatKind.SOURCE_SLIDE
+                    if allow_source_slide
+                    else VisualBeatKind.GENERATED_IMAGE
+                ),
                 duration_seconds=duration_seconds,
                 motion_preset=MotionPreset.NONE,
             )
@@ -210,6 +254,10 @@ class PresentationScript(BaseModel):
 class VisualScenePlan(BaseModel):
     scene_number: int = Field(ge=1)
     shot_number: int = Field(default=1, ge=1)
+    content_language: str = Field(default="und", min_length=2, max_length=35)
+    instructional_type: InstructionalContentType | None = None
+    learning_objective: str = Field(default="", max_length=400)
+    allow_readable_text: bool = False
     source_slide_numbers: list[int] = Field(default_factory=list)
     prompt: str = Field(min_length=1)
     media_mode: MediaMode = MediaMode.STATIC
@@ -253,8 +301,10 @@ class VisualArtifact(BaseModel):
     scene_number: int = Field(ge=1)
     shot_number: int = Field(default=1, ge=1)
     path: Path
+    start_path: Path | None = None
     kind: str = Field(pattern="^(image|video)$")
     revision: int = Field(default=1, ge=1)
+    source_slide_number: int | None = Field(default=None, ge=1)
 
 
 class AudioArtifact(BaseModel):
@@ -275,7 +325,9 @@ class VideoJobRequest(BaseModel):
     audience: str = "executive"
     tone: str = "professional and natural"
     production_mode: ProductionMode = ProductionMode.HYBRID_PRESENTATION
+    preset_options: dict[str, str] = Field(default_factory=dict)
     avatar_reference: Path | None = None
+    brand_kit: BrandKit | None = None
 
 
 class PreparedVideoJob(BaseModel):

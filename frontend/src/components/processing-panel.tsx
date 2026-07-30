@@ -129,6 +129,10 @@ export function ProcessingPanel({ job, error }: ProcessingPanelProps) {
         <span>
           Formato: {job.production_mode === "cinematic_story"
             ? "história cinematográfica"
+            : job.production_mode === "whiteboard_explainer"
+              ? "whiteboard explicativo"
+              : job.production_mode === "corporate_training"
+                ? "treinamento corporativo"
             : "apresentação híbrida"}
         </span>
       </div>

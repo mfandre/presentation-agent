@@ -1,12 +1,13 @@
-import { ChevronDown, Clock3, Film, History, Mic2, Presentation, Sparkles, WandSparkles } from "lucide-react";
-import { type FormEvent, useState } from "react";
+import { ChevronDown, Clock3, Film, GraduationCap, History, Mic2, PenTool, Presentation, Sparkles, WandSparkles } from "lucide-react";
+import { type FormEvent, useEffect, useState } from "react";
 
-import type { CreateVideoInput } from "../api/contracts";
+import type { CreateVideoInput, ProductionMode, ProductionPreset } from "../api/contracts";
 import { FileDropzone } from "./file-dropzone";
 
 interface ConfigurationFormProps {
   disabled: boolean;
   isResuming: boolean;
+  presets: ProductionPreset[];
   onSubmit(input: CreateVideoInput): Promise<void>;
   onResume(jobId: string): Promise<void>;
 }
@@ -25,9 +26,40 @@ const TONES = [
   { value: "didactic and approachable", label: "Didático e acessível" },
 ];
 
+const FALLBACK_PRESETS: ProductionPreset[] = [
+  {
+    id: "hybrid_presentation",
+    label: "Apresentação híbrida",
+    description: "Combina cenas geradas com páginas fixas quando informações precisam ser lidas.",
+    icon: "presentation",
+    strategy: "hybrid",
+    narrative_direction: "",
+    options: [],
+  },
+  {
+    id: "cinematic_story",
+    label: "História cinematográfica",
+    description: "Cria imagens e cenas originais do início ao fim, sem mostrar slides fixos.",
+    icon: "film",
+    strategy: "cinematic",
+    narrative_direction: "",
+    options: [],
+  },
+  {
+    id: "corporate_training",
+    label: "Treinamento corporativo",
+    description: "Alterna exemplos, processos e páginas fiéis conforme o objetivo de cada cena.",
+    icon: "graduation-cap",
+    strategy: "training",
+    narrative_direction: "",
+    options: [],
+  },
+];
+
 export function ConfigurationForm({
   disabled,
   isResuming,
+  presets,
   onSubmit,
   onResume,
 }: ConfigurationFormProps) {
@@ -36,10 +68,20 @@ export function ConfigurationForm({
   const [language, setLanguage] = useState("pt-BR");
   const [audience, setAudience] = useState("executive");
   const [tone, setTone] = useState("professional and natural");
-  const [productionMode, setProductionMode] = useState<"hybrid_presentation" | "cinematic_story">("hybrid_presentation");
+  const [productionMode, setProductionMode] = useState<ProductionMode>("hybrid_presentation");
+  const [presetOptions, setPresetOptions] = useState<Record<string, string>>({});
   const [fileError, setFileError] = useState<string | null>(null);
   const [resumeJobId, setResumeJobId] = useState("");
   const [resumeError, setResumeError] = useState<string | null>(null);
+  const availablePresets = presets.length > 0 ? presets : FALLBACK_PRESETS;
+  const selectedPreset = availablePresets.find((preset) => preset.id === productionMode);
+
+  useEffect(() => {
+    if (!selectedPreset) return;
+    setPresetOptions((current) => Object.fromEntries(
+      selectedPreset.options.map((option) => [option.id, current[option.id] ?? option.default]),
+    ));
+  }, [selectedPreset]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -54,6 +96,7 @@ export function ConfigurationForm({
       audience,
       tone,
       productionMode,
+      presetOptions,
     });
   };
 
@@ -102,37 +145,64 @@ export function ConfigurationForm({
 
         <fieldset className="production-mode-field">
           <legend>Formato visual</legend>
-          <label className={productionMode === "hybrid_presentation" ? "production-mode-card is-selected" : "production-mode-card"}>
-            <input
-              type="radio"
-              name="production-mode"
-              value="hybrid_presentation"
-              checked={productionMode === "hybrid_presentation"}
-              onChange={() => setProductionMode("hybrid_presentation")}
-              disabled={disabled}
-            />
-            <Presentation size={20} />
-            <span>
-              <strong>Apresentação híbrida</strong>
-              <small>Combina cenas geradas com páginas fixas quando números, tabelas ou diagramas precisam ser lidos.</small>
-            </span>
-          </label>
-          <label className={productionMode === "cinematic_story" ? "production-mode-card is-selected" : "production-mode-card"}>
-            <input
-              type="radio"
-              name="production-mode"
-              value="cinematic_story"
-              checked={productionMode === "cinematic_story"}
-              onChange={() => setProductionMode("cinematic_story")}
-              disabled={disabled}
-            />
-            <Film size={20} />
-            <span>
-              <strong>História cinematográfica</strong>
-              <small>Cria imagens e cenas originais do início ao fim, sem mostrar slides, páginas ou documentos fixos.</small>
-            </span>
-          </label>
+          {availablePresets.map((preset) => (
+            <label
+              className={productionMode === preset.id ? "production-mode-card is-selected" : "production-mode-card"}
+              key={preset.id}
+            >
+              <input
+                type="radio"
+                name="production-mode"
+                value={preset.id}
+                checked={productionMode === preset.id}
+                onChange={() => setProductionMode(preset.id)}
+                disabled={disabled}
+              />
+              {preset.icon === "film"
+                ? <Film size={20} />
+                : preset.icon === "pen-tool"
+                  ? <PenTool size={20} />
+                  : preset.icon === "graduation-cap"
+                    ? <GraduationCap size={20} />
+                  : <Presentation size={20} />}
+              <span>
+                <strong>{preset.label}</strong>
+                <small>{preset.description}</small>
+              </span>
+            </label>
+          ))}
         </fieldset>
+
+        {selectedPreset && selectedPreset.options.length > 0 && (
+          <div className="preset-options">
+            <div className="preset-options__heading">
+              <PenTool size={17} />
+              <span><strong>Personalize o preset</strong><small>Opções próprias de {selectedPreset.label}.</small></span>
+            </div>
+            <div className="field-grid">
+              {selectedPreset.options.map((option) => (
+                <label className="field" key={option.id}>
+                  <span>{option.label}</span>
+                  <div className="select-wrap">
+                    <select
+                      value={presetOptions[option.id] ?? option.default}
+                      disabled={disabled}
+                      onChange={(event) => setPresetOptions((current) => ({
+                        ...current,
+                        [option.id]: event.target.value,
+                      }))}
+                    >
+                      {option.choices.map((choice) => (
+                        <option value={choice.value} key={choice.value}>{choice.label}</option>
+                      ))}
+                    </select>
+                    <ChevronDown size={16} />
+                  </div>
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="field-grid">
           <label className="field">

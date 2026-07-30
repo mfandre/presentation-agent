@@ -247,7 +247,7 @@ async def test_pipeline_processes_narrative_scenes_not_every_source_page(tmp_pat
     assert images.calls == [(1, 1, [1, 2, 3])]
     assert speech.calls == ["Opening and context", "Development and conclusion"]
     assert clips.calls == [1]
-    assert renderer.calls == [(1, 1, "video"), (2, 4, "image")]
+    assert renderer.calls == [(1, 1, "video"), (2, 5, "image")]
     assert len(prepared.visual_images) == 2
     assert prepared.visual_images[1].path == document.slides[4].image_path
     assert result.duration_seconds == 20

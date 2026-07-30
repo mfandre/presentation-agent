@@ -17,25 +17,26 @@ from presentation_video.domain.ports import (
 )
 from presentation_video.infrastructure.avatar import NoAvatarRenderer
 from presentation_video.infrastructure.documents import ExtensionDocumentIngestorFactory
+from presentation_video.infrastructure.gemini_omni import GeminiOmniVideoAssetGenerator
 from presentation_video.infrastructure.narrative import (
     DebugNarrativeGenerator,
     PydanticAINarrativeGenerator,
     ReplicateNarrativeGenerator,
 )
+from presentation_video.infrastructure.replicate import ReplicatePredictionClient
 from presentation_video.infrastructure.reporting import LoggingJobReporter
 from presentation_video.infrastructure.speech import (
     EspeakSpeechSynthesizer,
     PydanticAIGoogleTTSSynthesizer,
     ReplicateTTSSynthesizer,
 )
-from presentation_video.infrastructure.video import FfmpegSceneRenderer, FfmpegVideoAssembler
-from presentation_video.infrastructure.replicate import ReplicatePredictionClient
 from presentation_video.infrastructure.vertex import (
     VertexClientFactory,
     VertexImageAssetGenerator,
     VertexSpeechSynthesizer,
     VertexVideoAssetGenerator,
 )
+from presentation_video.infrastructure.video import FfmpegSceneRenderer, FfmpegVideoAssembler
 from presentation_video.infrastructure.visual_media import (
     FfmpegImageAnimator,
     ReplicateImageAssetGenerator,
@@ -133,14 +134,16 @@ def build_pipeline(
             reporter=reporter or LoggingJobReporter(),
             work_root=settings.work_root,
             output_root=settings.output_root,
-            max_parallel_scenes=runtime.parallelism(
-                "generate_images", "speech", "animate", "render"
-            ),
+            max_parallel_images=runtime.parallelism("generate_images"),
+            max_parallel_speech=runtime.parallelism("speech"),
+            max_parallel_animations=runtime.parallelism("animate"),
+            max_parallel_renders=runtime.parallelism("render"),
             maximum_shot_seconds=maximum_shot_seconds,
             duration_tolerance_percent=float(duration_config.get("tolerance_percent", 5)),
             words_per_minute=int(duration_config.get("words_per_minute", 155)),
         )
     if image_config.provider == "slide" and video_config.provider in {
+        "gemini_omni",
         "replicate",
         "vertex_ai",
     }:
@@ -258,8 +261,24 @@ def build_pipeline(
             poll_interval_seconds=video_config.poll_interval_seconds,
             timeout_seconds=video_config.timeout_seconds,
         )
+    elif video_config.provider == "gemini_omni":
+        project = _require_google_cloud_project(settings, "Gemini Omni video generation")
+        if not settings.vertex_video_output_gcs_uri:
+            raise ValueError(
+                "VERTEX_VIDEO_OUTPUT_GCS_URI is required for Gemini Omni image-to-video"
+            )
+        video_clip_generator = GeminiOmniVideoAssetGenerator(
+            project,
+            settings.vertex_video_output_gcs_uri,
+            model=video_config.model or "gemini-omni-flash-preview",
+            aspect_ratio=str(runtime.raw("animate").get("aspect_ratio", "16:9")),
+            clip_duration_seconds=int(runtime.raw("animate").get("duration_seconds", 8)),
+            timeout_seconds=video_config.timeout_seconds,
+        )
     else:
-        raise ValueError("animate.provider must be 'ffmpeg', 'replicate', or 'vertex_ai'")
+        raise ValueError(
+            "animate.provider must be 'ffmpeg', 'replicate', 'vertex_ai', or 'gemini_omni'"
+        )
 
     speech_synthesizer: SpeechSynthesizer
     speech_raw = runtime.raw("speech")
@@ -318,7 +337,10 @@ def build_pipeline(
         reporter=reporter or LoggingJobReporter(),
         work_root=settings.work_root,
         output_root=settings.output_root,
-        max_parallel_scenes=runtime.parallelism("generate_images", "speech", "animate", "render"),
+        max_parallel_images=runtime.parallelism("generate_images"),
+        max_parallel_speech=runtime.parallelism("speech"),
+        max_parallel_animations=runtime.parallelism("animate"),
+        max_parallel_renders=runtime.parallelism("render"),
         maximum_shot_seconds=maximum_shot_seconds,
         duration_tolerance_percent=float(duration_config.get("tolerance_percent", 5)),
         words_per_minute=int(duration_config.get("words_per_minute", 155)),

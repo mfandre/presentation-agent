@@ -6,6 +6,7 @@ import {
   Clock3,
   GitBranch,
   LoaderCircle,
+  Minus,
   Pause,
   RefreshCw,
   RotateCcw,
@@ -17,6 +18,7 @@ import {
 import type {
   WorkflowDefinition,
   WorkflowSnapshot,
+  WorkflowStepDefinition,
   WorkflowStepStatus,
 } from "../api/contracts";
 import { HttpVideoGateway } from "../api/http-video-gateway";
@@ -32,12 +34,17 @@ const STEP_LABELS: Record<string, string> = {
   narrative: "Storytelling",
   speech: "Voz e alinhamento",
   scene_plan: "Planejamento de cenas e takes",
+  instructional_design: "Direção instrucional",
   visual_plan: "Planejamento visual",
+  whiteboard_concept_plan: "Plano didático whiteboard",
   prompt_compile: "Compilação de prompts",
   rule_validate: "Validação de regras",
   generate_images: "Geração de imagens",
+  whiteboard_master: "Ilustração mestre",
+  whiteboard_states: "Estados progressivos",
   visual_review: "Revisão humana",
   animate: "Animação",
+  whiteboard_animate: "Transições de desenho",
   visual_qa: "QA visual",
   render: "Renderização",
   assemble: "Montagem final",
@@ -49,7 +56,20 @@ function statusIcon(status: WorkflowStepStatus | undefined) {
   if (status === "running") return <LoaderCircle className="spin" size={15} />;
   if (status === "waiting") return <Pause size={15} />;
   if (status === "failed") return <AlertTriangle size={15} />;
+  if (status === "skipped") return <Minus size={15} />;
   return <Clock3 size={15} />;
+}
+
+function conditionLabel(step: WorkflowStepDefinition): string | null {
+  if (step.when === true) return null;
+  if (step.when === false) return "desativado";
+  if (typeof step.when === "string") return step.when;
+  const source = step.when.input ?? step.when.reference ?? "condição";
+  if ("equals" in step.when) return `${source} = ${String(step.when.equals)}`;
+  if ("not_equals" in step.when) return `${source} ≠ ${String(step.when.not_equals)}`;
+  if ("in" in step.when) return `${source} ∈ ${(step.when.in ?? []).join(", ")}`;
+  if ("not_in" in step.when) return `${source} ∉ ${(step.when.not_in ?? []).join(", ")}`;
+  return source;
 }
 
 export function WorkflowDesignPage({ activeJobId }: WorkflowDesignPageProps) {
@@ -125,6 +145,15 @@ export function WorkflowDesignPage({ activeJobId }: WorkflowDesignPageProps) {
     () => new Map(snapshot?.steps.map((step) => [step.step_id, step]) ?? []),
     [snapshot],
   );
+  const conditionalGroups = useMemo(() => {
+    const grouped = new Map<string, WorkflowStepDefinition[]>();
+    for (const step of definition?.steps ?? []) {
+      const label = conditionLabel(step);
+      if (!label) continue;
+      grouped.set(label, [...(grouped.get(label) ?? []), step]);
+    }
+    return [...grouped.entries()];
+  }, [definition]);
 
   return (
     <main className="workflow-page">
@@ -164,7 +193,55 @@ export function WorkflowDesignPage({ activeJobId }: WorkflowDesignPageProps) {
             </div>
           </section>
 
-          <section className="workflow-canvas" aria-label="Grafo do workflow">
+          {conditionalGroups.length > 0 && (
+            <section className="workflow-branches" aria-label="Ramificações condicionais do workflow">
+              <header className="workflow-branches__heading">
+                <div>
+                  <span><GitBranch size={16} /> Ramificações condicionais</span>
+                  <h2>O formato selecionado ativa caminhos diferentes</h2>
+                </div>
+                <small>Os caminhos voltam a convergir nas etapas com múltiplas dependências.</small>
+              </header>
+              <div className="workflow-branch-grid">
+                {conditionalGroups.map(([condition, steps]) => (
+                  <section className="workflow-branch" key={condition}>
+                    <header>
+                      <GitBranch size={15} />
+                      <div><small>quando</small><strong>{condition}</strong></div>
+                    </header>
+                    <div className="workflow-branch__steps">
+                      {steps.map((step, index) => {
+                        const status = runs.get(step.id)?.status;
+                        return (
+                          <div className={`workflow-branch-step workflow-branch-step--${status ?? "design"}`} key={step.id}>
+                            {index > 0 && <span className="workflow-branch-step__line" aria-hidden="true" />}
+                            <div>
+                              <small>{step.uses}</small>
+                              <strong>{STEP_LABELS[step.id] ?? step.id.replaceAll("_", " ")}</strong>
+                            </div>
+                            <span className={`workflow-status workflow-status--${status ?? "design"}`}>
+                              {statusIcon(status)} {status ?? "design"}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                ))}
+              </div>
+              <div className="workflow-branches__merge">
+                <span /><strong>Convergência</strong><span />
+                <small>
+                  {definition.steps
+                    .filter((step) => step.needs.length > 1)
+                    .map((step) => STEP_LABELS[step.id] ?? step.id)
+                    .join(" · ")}
+                </small>
+              </div>
+            </section>
+          )}
+
+          <section className="workflow-canvas" aria-label="Detalhamento linear do workflow">
             <div className="workflow-lane">
               {definition.steps.map((step, index) => {
                 const run = runs.get(step.id);

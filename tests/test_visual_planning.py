@@ -9,6 +9,7 @@ from presentation_video.domain.models import (
     PresentationVisualPlan,
     SceneScript,
     SlideContent,
+    VisualBeatKind,
     VisualScenePlan,
 )
 from presentation_video.infrastructure.replicate import ReplicatePredictionClient
@@ -137,6 +138,51 @@ def test_text_only_static_source_becomes_generated_editorial_image() -> None:
     assert scene.preserve_source_frame is False
     assert scene.source_slide_number is None
     assert scene.visual_beats[0].kind.value == "generated_image"
+
+
+def test_suitable_hybrid_static_source_remains_an_unchanged_source_slide() -> None:
+    document = PresentationDocument(
+        source_path=Path("presentation.pdf"),
+        slides=[
+            SlideContent(
+                number=1,
+                title="Approval matrix",
+                body_text="Exact values and responsibilities",
+                image_path=Path("page-1.png"),
+                source_frame_suitable=True,
+            )
+        ],
+    )
+    script = PresentationScript(
+        title="Story",
+        scenes=[
+            SceneScript(
+                scene_number=1,
+                source_slide_numbers=[1],
+                narration="Explain the exact approval matrix.",
+                target_seconds=20,
+                media_mode=MediaMode.STATIC,
+            )
+        ],
+        total_estimated_seconds=20,
+    )
+    plan = PresentationVisualPlan(
+        scenes=[
+            VisualScenePlan(
+                scene_number=1,
+                prompt="Preserve the exact approval matrix",
+                media_mode=MediaMode.STATIC,
+                source_slide_number=1,
+            )
+        ]
+    )
+
+    _validate_sequence(plan, script, document)
+
+    scene = plan.scenes[0]
+    assert scene.preserve_source_frame is True
+    assert scene.source_slide_number == 1
+    assert scene.visual_beats[0].kind == VisualBeatKind.SOURCE_SLIDE
 
 
 def test_creative_direction_has_no_fixed_corporate_blue_palette() -> None:

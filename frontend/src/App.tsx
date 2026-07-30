@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { BrainCircuit, Braces, Clapperboard, ShieldCheck, Workflow } from "lucide-react";
+import { BrainCircuit, Braces, Clapperboard, Palette, ShieldCheck, Workflow, XCircle } from "lucide-react";
 
+import { BrandKitPage } from "./components/brand-kit-page";
 import { ConfigurationForm } from "./components/configuration-form";
 import { DurationReviewPanel } from "./components/duration-review-panel";
 import { EmptyPreview } from "./components/empty-preview";
@@ -13,14 +14,14 @@ import { WorkflowDesignPage } from "./components/workflow-design-page";
 import { useVideoCreation } from "./hooks/use-video-creation";
 
 export default function App() {
-  const [page, setPage] = useState<"studio" | "workflow">(
-    window.location.hash === "#/workflow" ? "workflow" : "studio",
+  const [page, setPage] = useState<"studio" | "workflow" | "brand">(
+    window.location.hash === "#/workflow" ? "workflow" : window.location.hash === "#/brand" ? "brand" : "studio",
   );
-  const { job, debugMode, debugMaxScenes, debugReplayJobId, isSubmitting, isActing, error, createVideo, regenerateScene, approveVisuals, decideDuration, resumeVideo, reset, assetUrl } = useVideoCreation();
+  const { job, debugMode, debugMaxScenes, debugReplayJobId, productionPresets, isSubmitting, isActing, error, createVideo, regenerateScene, useSourceSlide, generateFromSourceSlide, approveVisuals, decideDuration, cancelVideo, resumeVideo, reset, assetUrl } = useVideoCreation();
   const isRunning = Boolean(job && !["completed", "cancelled", "failed"].includes(job.status));
 
   useEffect(() => {
-    const updatePage = () => setPage(window.location.hash === "#/workflow" ? "workflow" : "studio");
+    const updatePage = () => setPage(window.location.hash === "#/workflow" ? "workflow" : window.location.hash === "#/brand" ? "brand" : "studio");
     window.addEventListener("hashchange", updatePage);
     return () => window.removeEventListener("hashchange", updatePage);
   }, []);
@@ -35,6 +36,7 @@ export default function App() {
         <nav className="app-nav" aria-label="Navegação principal">
           <a className={page === "studio" ? "is-active" : ""} href="#/"><Clapperboard size={16} /> Estúdio</a>
           <a className={page === "workflow" ? "is-active" : ""} href="#/workflow"><Workflow size={16} /> Workflow</a>
+          <a className={page === "brand" ? "is-active" : ""} href="#/brand"><Palette size={16} /> Identidade</a>
         </nav>
         <div className={`header-status${debugMode ? " header-status--debug" : ""}`}><span className="status-dot" /> {debugMode ? "Modo debug · sem APIs pagas" : "API conectada"}</div>
         <a className="header-link" href="/docs" target="_blank" rel="noreferrer"><Braces size={17} /> <span>API Docs</span></a>
@@ -64,19 +66,39 @@ export default function App() {
             <ConfigurationForm
               disabled={isSubmitting || isRunning}
               isResuming={isActing}
+              presets={productionPresets}
               onSubmit={createVideo}
               onResume={resumeVideo}
             />
           </aside>
           <section className="workspace-card" aria-live="polite">
-            {job && <JobTimer job={job} />}
+            {job && (
+              <div className="job-toolbar">
+                <JobTimer job={job} />
+                {isRunning && (
+                  <button
+                    className="cancel-job-button"
+                    type="button"
+                    disabled={isActing}
+                    onClick={() => {
+                      if (window.confirm("Cancelar este processamento? Os artefatos já concluídos serão preservados.")) {
+                        void cancelVideo();
+                      }
+                    }}
+                  >
+                    <XCircle size={17} />
+                    {isActing ? "Cancelando…" : "Cancelar processamento"}
+                  </button>
+                )}
+              </div>
+            )}
             {!job && !error && <EmptyPreview />}
             {job && !["awaiting_duration_approval", "awaiting_visual_approval", "completed", "cancelled", "failed"].includes(job.status) && <ProcessingPanel job={job} error={error} />}
             {job?.status === "awaiting_duration_approval" && (
               <DurationReviewPanel job={job} isActing={isActing} error={error} onDecision={decideDuration} />
             )}
             {job?.status === "awaiting_visual_approval" && (
-              <VisualReviewPanel job={job} isActing={isActing} error={error} assetUrl={assetUrl} onRegenerate={regenerateScene} onApprove={approveVisuals} />
+              <VisualReviewPanel job={job} isActing={isActing} error={error} assetUrl={assetUrl} onRegenerate={regenerateScene} onUseSourceSlide={useSourceSlide} onGenerateFromSourceSlide={generateFromSourceSlide} onApprove={approveVisuals} />
             )}
             {job?.status === "completed" && <ResultPanel job={job} assetUrl={assetUrl} onReset={reset} />}
             {job?.status === "cancelled" && <ErrorPanel message={job.detail || "Processamento cancelado."} onReset={reset} />}
@@ -92,6 +114,7 @@ export default function App() {
         </section>
       </main>
       {page === "workflow" && <WorkflowDesignPage activeJobId={job?.job_id} />}
+      {page === "brand" && <BrandKitPage />}
 
       <footer><span>Narrativa AI · Starter proprietário</span><span>React + TypeScript · FastAPI + Pydantic AI</span></footer>
     </div>

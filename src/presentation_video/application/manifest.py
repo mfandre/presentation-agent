@@ -26,6 +26,12 @@ def write_job_manifest(
         "audience": prepared.request.audience,
         "tone": prepared.request.tone,
         "production_mode": prepared.request.production_mode.value,
+        "preset_options": prepared.request.preset_options,
+        "brand_kit": (
+            prepared.request.brand_kit.model_dump(mode="json")
+            if prepared.request.brand_kit
+            else None
+        ),
         "approved_images": [
             image.model_dump(mode="json") for image in prepared.visual_images
         ],

@@ -34,6 +34,7 @@ export interface VideoJob {
   audience: string;
   tone: string;
   production_mode: ProductionMode;
+  preset_options: Record<string, string>;
   created_at: string;
   updated_at: string;
   start_datetime: string;
@@ -48,9 +49,65 @@ export interface VideoJob {
   regenerating_scene_numbers: number[];
   debug_mode: boolean;
   creative_direction: CreativeDirection | null;
+  brand_kit: BrandKit | null;
+  source_pages: SourcePage[];
 }
 
-export type ProductionMode = "hybrid_presentation" | "cinematic_story";
+export interface SourcePage {
+  number: number;
+  title: string;
+  image_url: string;
+}
+
+export interface BrandKit {
+  name: string;
+  version: number;
+  primary_color: string;
+  secondary_color: string;
+  accent_color: string;
+  background_color: string;
+  heading_font: string;
+  body_font: string;
+  visual_style: string;
+  image_text_policy: "avoid" | "minimal" | "allowed";
+  logo_url: string | null;
+  opening_image_url: string | null;
+  closing_image_url: string | null;
+}
+
+export type BrandKitUpdate = Omit<
+  BrandKit,
+  "version" | "logo_url" | "opening_image_url" | "closing_image_url"
+>;
+
+export type ProductionMode =
+  | "hybrid_presentation"
+  | "cinematic_story"
+  | "whiteboard_explainer"
+  | "corporate_training";
+
+export interface PresetChoice {
+  value: string;
+  label: string;
+}
+
+export interface PresetOption {
+  id: string;
+  label: string;
+  type: "select";
+  default: string;
+  choices: PresetChoice[];
+}
+
+export interface ProductionPreset {
+  id: ProductionMode;
+  label: string;
+  description: string;
+  icon: "presentation" | "film" | "pen-tool" | "graduation-cap";
+  strategy: "hybrid" | "cinematic" | "whiteboard" | "training";
+  narrative_direction: string;
+  options: PresetOption[];
+}
 
 export interface CreativeDirection {
   hook_question: string;
@@ -102,6 +159,9 @@ export interface SceneImage {
   forbidden_substitutions: string[];
   source_slide_number: number | null;
   preserve_source_frame: boolean;
+  instructional_type: "concept" | "process" | "rule" | "behavior" | "system_demo" | "recap" | null;
+  learning_objective: string;
+  allow_readable_text: boolean;
 }
 
 export interface VisualBeat {
@@ -119,6 +179,7 @@ export interface CreateVideoInput {
   audience: string;
   tone: string;
   productionMode: ProductionMode;
+  presetOptions: Record<string, string>;
 }
 
 export interface RuntimeConfig {
@@ -150,7 +211,14 @@ export interface WorkflowStepDefinition {
   inputs: Record<string, unknown>;
   config: Record<string, unknown>;
   outputs: Record<string, string>;
-  when: boolean | string;
+  when: boolean | string | {
+    input?: string;
+    reference?: string;
+    equals?: unknown;
+    not_equals?: unknown;
+    in?: unknown[];
+    not_in?: unknown[];
+  };
   foreach: string | null;
   parallelism: number;
   retry: {
@@ -203,13 +271,20 @@ export interface WorkflowSnapshot {
 
 export interface VideoGateway {
   getRuntimeConfig(): Promise<RuntimeConfig>;
+  getProductionPresets(): Promise<ProductionPreset[]>;
+  getBrandKit(): Promise<BrandKit>;
+  updateBrandKit(input: BrandKitUpdate): Promise<BrandKit>;
+  uploadBrandAsset(kind: "logo" | "opening_image" | "closing_image", file: File): Promise<BrandKit>;
   getWorkflows(): Promise<WorkflowDefinition[]>;
   getWorkflowRun(jobId: string): Promise<WorkflowSnapshot>;
   createVideo(input: CreateVideoInput): Promise<VideoJob>;
   getVideo(jobId: string): Promise<VideoJob>;
   regenerateScene(jobId: string, sceneNumber: number, shotNumber: number, prompt: string): Promise<VideoJob>;
+  useSourceSlide(jobId: string, sceneNumber: number, shotNumber: number, sourceSlideNumber: number): Promise<VideoJob>;
+  generateFromSourceSlide(jobId: string, sceneNumber: number, shotNumber: number, sourceSlideNumber: number, prompt: string): Promise<VideoJob>;
   approveVisuals(jobId: string): Promise<VideoJob>;
   decideDuration(jobId: string, decision: "summarize" | "accept" | "cancel"): Promise<VideoJob>;
+  cancelVideo(jobId: string): Promise<VideoJob>;
   resumeVideo(jobId: string): Promise<VideoJob>;
   assetUrl(path: string): string;
 }
