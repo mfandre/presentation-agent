@@ -90,11 +90,36 @@ export function BrandKitPage() {
             <label>Fonte de corpo<input value={draft.body_font} onChange={(event) => set("body_font", event.target.value)} /></label>
           </div>
           <label>Direção visual<textarea rows={4} value={draft.visual_style} onChange={(event) => set("visual_style", event.target.value)} /></label>
-          <label>Texto dentro das imagens
-            <select value={draft.image_text_policy} onChange={(event) => set("image_text_policy", event.target.value as BrandKitUpdate["image_text_policy"])}>
-              <option value="avoid">Evitar</option><option value="minimal">Mínimo</option><option value="allowed">Permitido quando necessário</option>
-            </select>
-          </label>
+          <fieldset className="watermark-settings">
+            <label className="watermark-toggle">
+              <input
+                type="checkbox"
+                checked={draft.watermark_enabled}
+                onChange={(event) => set("watermark_enabled", event.target.checked)}
+              />
+              <span><strong>Usar logo como watermark</strong><small>Aplica uma assinatura discreta durante todo o vídeo.</small></span>
+            </label>
+            {draft.watermark_enabled && (
+              <>
+                <label>Posição
+                  <select value={draft.watermark_position} onChange={(event) => set("watermark_position", event.target.value as BrandKitUpdate["watermark_position"])}>
+                    <option value="top_left">Superior esquerdo</option>
+                    <option value="top_right">Superior direito</option>
+                    <option value="bottom_left">Inferior esquerdo</option>
+                    <option value="bottom_right">Inferior direito</option>
+                  </select>
+                </label>
+                <div className="brand-field-grid">
+                  <label>Opacidade · {Math.round(draft.watermark_opacity * 100)}%
+                    <input type="range" min="0.05" max="1" step="0.05" value={draft.watermark_opacity} onChange={(event) => set("watermark_opacity", Number(event.target.value))} />
+                  </label>
+                  <label>Tamanho · {draft.watermark_width_percent}% da tela
+                    <input type="range" min="4" max="30" step="1" value={draft.watermark_width_percent} onChange={(event) => set("watermark_width_percent", Number(event.target.value))} />
+                  </label>
+                </div>
+              </>
+            )}
+          </fieldset>
           <button className="primary-button" type="button" disabled={busy} onClick={() => void save()}>
             {busy ? <LoaderCircle className="spin" size={17} /> : <Save size={17} />} Salvar identidade
           </button>

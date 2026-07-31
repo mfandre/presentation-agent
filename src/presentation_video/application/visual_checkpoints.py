@@ -9,6 +9,7 @@ from presentation_video.application.production_policy import shots_or_default
 from presentation_video.application.production_presets import validate_preset_plan
 from presentation_video.application.production_presets import transform_visual_plan
 from presentation_video.application.brand import apply_brand_kit
+from presentation_video.application.brand import apply_brand_images
 from presentation_video.application.whiteboard_states import (
     build_progressive_whiteboard_states,
 )
@@ -132,7 +133,7 @@ async def restore_prepared_job(
             document=document,
             script=script,
             visual_plan=visual_plan,
-            visual_images=images,
+            visual_images=apply_brand_images(images, request.brand_kit),
             work_dir=work_dir,
             output_dir=output_dir,
             script_path=script_path,
@@ -213,7 +214,7 @@ async def restore_prepared_job(
         document=document,
         script=script,
         visual_plan=visual_plan,
-        visual_images=images,
+        visual_images=apply_brand_images(images, request.brand_kit),
         work_dir=work_dir,
         output_dir=output_dir,
         script_path=script_path,

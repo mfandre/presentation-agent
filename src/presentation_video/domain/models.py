@@ -65,6 +65,13 @@ class BrandKit(BaseModel):
         default="avoid",
         pattern=r"^(avoid|minimal|allowed)$",
     )
+    watermark_enabled: bool = False
+    watermark_position: str = Field(
+        default="bottom_right",
+        pattern=r"^(top_left|top_right|bottom_left|bottom_right)$",
+    )
+    watermark_opacity: float = Field(default=0.35, ge=0.05, le=1)
+    watermark_width_percent: int = Field(default=10, ge=4, le=30)
     logo_path: Path | None = None
     opening_image_path: Path | None = None
     closing_image_path: Path | None = None
@@ -197,6 +204,15 @@ class CreativeDirection(BaseModel):
     transformation_to: str = Field(default="", max_length=300)
     recurring_visual_principle: str = Field(default="", max_length=500)
     concept_mappings: list["ConceptMapping"] = Field(default_factory=list, max_length=8)
+    characters: list["CharacterProfile"] = Field(default_factory=list, max_length=8)
+
+
+class CharacterProfile(BaseModel):
+    id: str = Field(min_length=1, max_length=60, pattern=r"^[a-z0-9_-]+$")
+    narrative_role: str = Field(min_length=1, max_length=160)
+    physical_appearance: str = Field(min_length=1, max_length=500)
+    wardrobe: str = Field(min_length=1, max_length=300)
+    identity_markers: list[str] = Field(default_factory=list, max_length=6)
 
 
 class ConceptMapping(BaseModel):
@@ -269,7 +285,9 @@ class VisualScenePlan(BaseModel):
     scene_purpose: str = Field(default="", max_length=300)
     relationship_to_thesis: str = Field(default="", max_length=400)
     narrative_progress: str = Field(default="", max_length=300)
+    action_progression: list[str] = Field(default_factory=list, max_length=12)
     visible_evidence: list[str] = Field(default_factory=list, max_length=6)
+    recurring_character_ids: list[str] = Field(default_factory=list, max_length=8)
     forbidden_substitutions: list[str] = Field(default_factory=list, max_length=6)
     negative_prompt: str = (
         "text, subtitles, logos, watermarks, distorted anatomy, generic corporate stock photo, "
@@ -305,6 +323,7 @@ class VisualArtifact(BaseModel):
     kind: str = Field(pattern="^(image|video)$")
     revision: int = Field(default=1, ge=1)
     source_slide_number: int | None = Field(default=None, ge=1)
+    locked_static: bool = False
 
 
 class AudioArtifact(BaseModel):

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Braces,
@@ -9,7 +9,6 @@ import {
   Minus,
   Pause,
   RefreshCw,
-  RotateCcw,
   Settings2,
   Workflow,
   Zap,
@@ -25,6 +24,13 @@ import { HttpVideoGateway } from "../api/http-video-gateway";
 
 interface WorkflowDesignPageProps {
   activeJobId?: string;
+}
+
+interface WorkflowEdge {
+  id: string;
+  path: string;
+  state: WorkflowStepStatus | "design";
+  relationship: "execution" | "data";
 }
 
 const gateway = new HttpVideoGateway();
@@ -78,6 +84,10 @@ export function WorkflowDesignPage({ activeJobId }: WorkflowDesignPageProps) {
   const [snapshot, setSnapshot] = useState<WorkflowSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const graphRef = useRef<HTMLDivElement | null>(null);
+  const nodeRefs = useRef(new Map<string, HTMLElement>());
+  const [edges, setEdges] = useState<WorkflowEdge[]>([]);
+  const [graphSize, setGraphSize] = useState({ width: 0, height: 0 });
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -145,15 +155,95 @@ export function WorkflowDesignPage({ activeJobId }: WorkflowDesignPageProps) {
     () => new Map(snapshot?.steps.map((step) => [step.step_id, step]) ?? []),
     [snapshot],
   );
-  const conditionalGroups = useMemo(() => {
-    const grouped = new Map<string, WorkflowStepDefinition[]>();
-    for (const step of definition?.steps ?? []) {
-      const label = conditionLabel(step);
-      if (!label) continue;
-      grouped.set(label, [...(grouped.get(label) ?? []), step]);
+  const graphLevels = useMemo(() => {
+    if (!definition) return [];
+    const levels = new Map<string, number>();
+    const steps = new Map(definition.steps.map((step) => [step.id, step]));
+    const levelFor = (step: WorkflowStepDefinition): number => {
+      const known = levels.get(step.id);
+      if (known !== undefined) return known;
+      const level = step.needs.length === 0
+        ? 0
+        : Math.max(...step.needs.map((dependency) => levelFor(steps.get(dependency)!))) + 1;
+      levels.set(step.id, level);
+      return level;
+    };
+    for (const step of definition.steps) levelFor(step);
+    const columns: WorkflowStepDefinition[][] = [];
+    for (const step of definition.steps) {
+      const level = levels.get(step.id) ?? 0;
+      (columns[level] ??= []).push(step);
     }
-    return [...grouped.entries()];
+    return columns;
   }, [definition]);
+
+  useLayoutEffect(() => {
+    const graph = graphRef.current;
+    if (!graph || !definition) return;
+    const drawEdges = () => {
+      const graphBounds = graph.getBoundingClientRect();
+      const nextEdges: WorkflowEdge[] = [];
+      const stepsById = new Map(definition.steps.map((step) => [step.id, step]));
+      const isAncestor = (ancestorId: string, stepId: string, visited = new Set<string>()): boolean => {
+        if (ancestorId === stepId) return true;
+        if (visited.has(stepId)) return false;
+        visited.add(stepId);
+        return (stepsById.get(stepId)?.needs ?? []).some(
+          (dependency) => isAncestor(ancestorId, dependency, new Set(visited)),
+        );
+      };
+      let longEdgeIndex = 0;
+      for (const target of definition.steps) {
+        const targetElement = nodeRefs.current.get(target.id);
+        if (!targetElement) continue;
+        const targetBounds = targetElement.getBoundingClientRect();
+        for (const sourceId of target.needs) {
+          const sourceElement = nodeRefs.current.get(sourceId);
+          if (!sourceElement) continue;
+          const sourceBounds = sourceElement.getBoundingClientRect();
+          const startX = sourceBounds.right - graphBounds.left;
+          const startY = sourceBounds.top + sourceBounds.height / 2 - graphBounds.top;
+          const endX = targetBounds.left - graphBounds.left;
+          const endY = targetBounds.top + targetBounds.height / 2 - graphBounds.top;
+          const horizontalDistance = endX - startX;
+          const isLongEdge = horizontalDistance > 390;
+          const path = isLongEdge
+            ? (() => {
+                const exitX = startX + 22;
+                const entryX = endX - 22;
+                const railY = 18 + (longEdgeIndex++ % 8) * 8;
+                return `M ${startX} ${startY} L ${exitX} ${startY} Q ${exitX + 8} ${startY} ${exitX + 8} ${startY - 8} L ${exitX + 8} ${railY + 8} Q ${exitX + 8} ${railY} ${exitX + 16} ${railY} L ${entryX - 16} ${railY} Q ${entryX - 8} ${railY} ${entryX - 8} ${railY + 8} L ${entryX - 8} ${endY - 8} Q ${entryX - 8} ${endY} ${entryX} ${endY} L ${endX} ${endY}`;
+              })()
+            : (() => {
+                const bend = Math.max(horizontalDistance * 0.48, 24);
+                return `M ${startX} ${startY} C ${startX + bend} ${startY}, ${endX - bend} ${endY}, ${endX} ${endY}`;
+              })();
+          nextEdges.push({
+            id: `${sourceId}-${target.id}`,
+            path,
+            state: runs.get(target.id)?.status ?? "design",
+            relationship: target.needs.some(
+              (otherDependency) => (
+                otherDependency !== sourceId
+                && isAncestor(sourceId, otherDependency)
+              ),
+            ) ? "data" : "execution",
+          });
+        }
+      }
+      setGraphSize({ width: graph.scrollWidth, height: graph.scrollHeight });
+      setEdges(nextEdges);
+    };
+    const observer = new ResizeObserver(drawEdges);
+    observer.observe(graph);
+    for (const element of nodeRefs.current.values()) observer.observe(element);
+    drawEdges();
+    window.addEventListener("resize", drawEdges);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", drawEdges);
+    };
+  }, [definition, graphLevels, runs]);
 
   return (
     <main className="workflow-page">
@@ -193,110 +283,90 @@ export function WorkflowDesignPage({ activeJobId }: WorkflowDesignPageProps) {
             </div>
           </section>
 
-          {conditionalGroups.length > 0 && (
-            <section className="workflow-branches" aria-label="Ramificações condicionais do workflow">
-              <header className="workflow-branches__heading">
-                <div>
-                  <span><GitBranch size={16} /> Ramificações condicionais</span>
-                  <h2>O formato selecionado ativa caminhos diferentes</h2>
-                </div>
-                <small>Os caminhos voltam a convergir nas etapas com múltiplas dependências.</small>
-              </header>
-              <div className="workflow-branch-grid">
-                {conditionalGroups.map(([condition, steps]) => (
-                  <section className="workflow-branch" key={condition}>
-                    <header>
-                      <GitBranch size={15} />
-                      <div><small>quando</small><strong>{condition}</strong></div>
-                    </header>
-                    <div className="workflow-branch__steps">
-                      {steps.map((step, index) => {
-                        const status = runs.get(step.id)?.status;
+          <section className="workflow-dag" aria-label="Diagrama condicional do workflow">
+            <header className="workflow-dag__heading">
+              <div>
+                <span><GitBranch size={16} /> DAG completo</span>
+                <h2>Etapas, decisões e convergências</h2>
+              </div>
+              <small>Role horizontalmente para acompanhar o fluxo. Condições ficam visíveis dentro de cada ramificação.</small>
+            </header>
+            <div className="workflow-dag__viewport">
+              <div className="workflow-dag__columns" ref={graphRef}>
+                <svg
+                  className="workflow-dag__edges"
+                  width={graphSize.width}
+                  height={graphSize.height}
+                  viewBox={`0 0 ${graphSize.width} ${graphSize.height}`}
+                  aria-hidden="true"
+                >
+                  <defs>
+                    <marker id="workflow-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
+                      <path d="M 0 0 L 8 4 L 0 8 z" />
+                    </marker>
+                  </defs>
+                  {edges.map((edge) => (
+                    <path
+                      className={`workflow-dag__edge workflow-dag__edge--${edge.state} workflow-dag__edge--${edge.relationship}`}
+                      d={edge.path}
+                      key={edge.id}
+                      markerEnd="url(#workflow-arrow)"
+                    />
+                  ))}
+                </svg>
+                {graphLevels.map((column, columnIndex) => (
+                  <section className="workflow-dag__column" key={columnIndex}>
+                    <span className="workflow-dag__level">nível {columnIndex + 1}</span>
+                    <div className="workflow-dag__stack">
+                      {column.map((step) => {
+                        const run = runs.get(step.id);
+                        const status = run?.status;
+                        const condition = conditionLabel(step);
+                        const stepIndex = definition.steps.findIndex((item) => item.id === step.id);
                         return (
-                          <div className={`workflow-branch-step workflow-branch-step--${status ?? "design"}`} key={step.id}>
-                            {index > 0 && <span className="workflow-branch-step__line" aria-hidden="true" />}
-                            <div>
-                              <small>{step.uses}</small>
-                              <strong>{STEP_LABELS[step.id] ?? step.id.replaceAll("_", " ")}</strong>
+                          <article
+                            className={`workflow-dag-node workflow-dag-node--${status ?? "design"}${step.checkpoint ? " workflow-dag-node--checkpoint" : ""}${condition ? " workflow-dag-node--conditional" : ""}`}
+                            key={step.id}
+                            ref={(element) => {
+                              if (element) nodeRefs.current.set(step.id, element);
+                              else nodeRefs.current.delete(step.id);
+                            }}
+                          >
+                            {columnIndex > 0 && <span className="workflow-dag-node__inlet" aria-hidden="true" />}
+                            {columnIndex < graphLevels.length - 1 && <span className="workflow-dag-node__outlet" aria-hidden="true" />}
+                            {condition && <div className="workflow-condition"><GitBranch size={12} /><span>quando</span><strong>{condition}</strong></div>}
+                            <header>
+                              <span className="workflow-node__index">{String(stepIndex + 1).padStart(2, "0")}</span>
+                              <div><small>{step.uses}</small><h3>{STEP_LABELS[step.id] ?? step.id.replaceAll("_", " ")}</h3></div>
+                            </header>
+                            <span className={`workflow-status workflow-status--${status ?? "design"}`}>{statusIcon(status)} {status ?? "design"}</span>
+                            <div className="workflow-dag-node__dependencies">
+                              {step.needs.map((dependency) => <span key={dependency}>← {STEP_LABELS[dependency] ?? dependency}</span>)}
                             </div>
-                            <span className={`workflow-status workflow-status--${status ?? "design"}`}>
-                              {statusIcon(status)} {status ?? "design"}
-                            </span>
-                          </div>
+                            <div className="workflow-node__meta">
+                              {typeof step.config.provider === "string" && <span className="provider-chip"><Settings2 size={13} /> {step.config.provider}</span>}
+                              {step.checkpoint && <span className="checkpoint-chip"><Pause size={13} /> aprovação</span>}
+                              {step.parallelism > 1 && <span><Zap size={13} /> ×{step.parallelism}</span>}
+                            </div>
+                            {Object.keys(step.config).length > 0 && (
+                              <details className="workflow-node__config">
+                                <summary><Braces size={14} /> Configuração</summary>
+                                <pre>{JSON.stringify(step.config, null, 2)}</pre>
+                              </details>
+                            )}
+                          </article>
                         );
                       })}
                     </div>
                   </section>
                 ))}
               </div>
-              <div className="workflow-branches__merge">
-                <span /><strong>Convergência</strong><span />
-                <small>
-                  {definition.steps
-                    .filter((step) => step.needs.length > 1)
-                    .map((step) => STEP_LABELS[step.id] ?? step.id)
-                    .join(" · ")}
-                </small>
-              </div>
-            </section>
-          )}
-
-          <section className="workflow-canvas" aria-label="Detalhamento linear do workflow">
-            <div className="workflow-lane">
-              {definition.steps.map((step, index) => {
-                const run = runs.get(step.id);
-                const status = run?.status;
-                return (
-                  <div className="workflow-node-wrap" key={step.id}>
-                    {index > 0 && (
-                      <div className="workflow-connector" aria-hidden="true">
-                        <span />
-                        <small>{step.needs.length > 1 ? `${step.needs.length} dependências` : ""}</small>
-                      </div>
-                    )}
-                    <article className={`workflow-node workflow-node--${status ?? "design"}${step.checkpoint ? " workflow-node--checkpoint" : ""}`}>
-                      <header>
-                        <span className="workflow-node__index">{String(index + 1).padStart(2, "0")}</span>
-                        <div>
-                          <small>{step.uses}</small>
-                          <h2>{STEP_LABELS[step.id] ?? step.id.replaceAll("_", " ")}</h2>
-                        </div>
-                        <span className={`workflow-status workflow-status--${status ?? "design"}`}>
-                          {statusIcon(status)} {status ?? "design"}
-                        </span>
-                      </header>
-                      <div className="workflow-node__meta">
-                        {typeof step.config.provider === "string" && (
-                          <span className="provider-chip"><Settings2 size={14} /> {step.config.provider}</span>
-                        )}
-                        {typeof step.config.model === "string" && (
-                          <span className="model-chip">{step.config.model}</span>
-                        )}
-                        {step.needs.length > 0 && <span><GitBranch size={14} /> após {step.needs.join(", ")}</span>}
-                        <span><RotateCcw size={14} /> {step.retry.attempts} tentativa{step.retry.attempts === 1 ? "" : "s"}</span>
-                        {step.parallelism > 1 && <span><Zap size={14} /> paralelo ×{step.parallelism}</span>}
-                        {step.checkpoint && <span className="checkpoint-chip"><Pause size={14} /> aprovação humana</span>}
-                      </div>
-                      {Object.keys(step.config).length > 0 && (
-                        <details className="workflow-node__config">
-                          <summary><Braces size={14} /> Configuração do step</summary>
-                          <pre>{JSON.stringify(step.config, null, 2)}</pre>
-                        </details>
-                      )}
-                      {run && (
-                        <footer>
-                          <span>Tentativa registrada: {run.attempt}</span>
-                          {run.error && <strong>{run.error}</strong>}
-                        </footer>
-                      )}
-                    </article>
-                  </div>
-                );
-              })}
             </div>
           </section>
 
           <section className="workflow-legend">
+            <span><i className="legend-line legend-line--execution" />Ordem de execução</span>
+            <span><i className="legend-line legend-line--data" />Consumo de dados</span>
             <span><i className="legend-dot legend-dot--running" />Em execução</span>
             <span><i className="legend-dot legend-dot--waiting" />Aguardando aprovação</span>
             <span><i className="legend-dot legend-dot--completed" />Concluído</span>

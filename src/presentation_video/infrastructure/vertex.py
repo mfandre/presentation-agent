@@ -124,11 +124,24 @@ class VertexImageAssetGenerator:
         if plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
             raise ValueError("Preserved static scenes must use an unchanged source page")
 
+        has_identity_reference = any(
+            slide.title.startswith("Character identity reference")
+            for slide in source_slides
+        )
+        identity_instruction = (
+            " The attachment titled Character identity reference is a cast reference only. Copy "
+            "the recurring person's identity and wardrobe, but explicitly change pose, action, "
+            "camera angle, shot size, framing, background composition, and moment according to the "
+            "current shot. Never recreate that reference frame."
+            if has_identity_reference
+            else ""
+        )
         prompt = (
             f"{_visual_prompt(plan, source_slides)} "
             "The attached source-page images are grounding references only. Preserve their factual "
             "meaning and recognizable subject matter, but do not copy their typography, captions, "
             "interfaces, charts, logos, or page layout into the generated image."
+            f"{identity_instruction}"
         )
         contents: list[Any] = [prompt]
         reference_count = 0

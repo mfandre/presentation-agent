@@ -133,6 +133,10 @@ class BrandKitView(BaseModel):
     body_font: str
     visual_style: str
     image_text_policy: str
+    watermark_enabled: bool
+    watermark_position: str
+    watermark_opacity: float
+    watermark_width_percent: int
     logo_url: str | None = None
     opening_image_url: str | None = None
     closing_image_url: str | None = None
@@ -148,6 +152,12 @@ class BrandKitUpdate(BaseModel):
     body_font: str = Field(min_length=1, max_length=80)
     visual_style: str = Field(min_length=1, max_length=500)
     image_text_policy: Literal["avoid", "minimal", "allowed"] = "avoid"
+    watermark_enabled: bool = False
+    watermark_position: Literal[
+        "top_left", "top_right", "bottom_left", "bottom_right"
+    ] = "bottom_right"
+    watermark_opacity: float = Field(default=0.35, ge=0.05, le=1)
+    watermark_width_percent: int = Field(default=10, ge=4, le=30)
 
 
 class SourcePageView(BaseModel):
@@ -670,7 +680,18 @@ def _ensure_completed_job_captions(
     ]
     if not scenes:
         raise ValueError(f"Debug replay job {job_id} has no rendered scenes")
-    return write_caption_files(build_caption_cues(script, scenes), output_dir, language)
+    caption_offset = float(
+        (manifest.get("captions") or {}).get("start_offset_seconds") or 0
+    )
+    return write_caption_files(
+        build_caption_cues(
+            script,
+            scenes,
+            start_offset_seconds=caption_offset,
+        ),
+        output_dir,
+        language,
+    )
 
 
 async def _replay_debug_job(job_id: str, source_job_id: str) -> None:

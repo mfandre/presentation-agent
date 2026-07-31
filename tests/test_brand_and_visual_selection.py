@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from presentation_video.application.brand import apply_brand_kit
+from presentation_video.application.brand import apply_brand_images, apply_brand_kit
 from presentation_video.application.visual_checkpoints import select_source_slide
 from presentation_video.domain.models import (
     BrandAssetKind,
@@ -62,6 +62,33 @@ def test_brand_kit_is_applied_without_adding_logo_to_scene_prompt() -> None:
     ]
     assert "warm editorial illustration" in branded.scenes[0].visual_style
     assert "do not add a logo" in branded.scenes[0].visual_style
+
+
+def test_brand_cards_do_not_replace_narrative_review_assets(tmp_path: Path) -> None:
+    opening = tmp_path / "opening.png"
+    opening.write_bytes(b"opening")
+    closing = tmp_path / "closing.png"
+    closing.write_bytes(b"closing")
+    images = [
+        VisualArtifact(
+            scene_number=scene_number,
+            shot_number=shot_number,
+            path=tmp_path / f"scene-{scene_number}-{shot_number}.png",
+            kind="image",
+        )
+        for scene_number, shot_number in ((1, 1), (2, 1), (3, 1), (3, 2))
+    ]
+
+    branded = apply_brand_images(
+        images,
+        BrandKit(opening_image_path=opening, closing_image_path=closing),
+    )
+
+    assert branded[0].path != opening
+    assert branded[1].path not in {opening, closing}
+    assert all(image.path != closing for image in branded[2:])
+    assert branded[0].locked_static is False
+    assert all(not image.locked_static for image in branded[2:])
 
 
 def test_selecting_slide_for_one_video_take_does_not_change_whole_scene(

@@ -48,3 +48,27 @@ def test_caption_files_cover_rendered_timeline_and_export_vtt_srt(tmp_path: Path
     assert vtt_path.read_text(encoding="utf-8").startswith("WEBVTT\n")
     assert "00:00:00.000 -->" in vtt_path.read_text(encoding="utf-8")
     assert "00:00:00,000 -->" in srt_path.read_text(encoding="utf-8")
+
+
+def test_caption_timeline_can_start_after_silent_opening_card(tmp_path: Path) -> None:
+    script = PresentationScript(
+        title="Opening",
+        scenes=[
+            SceneScript(
+                scene_number=1,
+                source_slide_numbers=[1],
+                narration="A narração começa depois da abertura.",
+                target_seconds=5,
+                media_mode=MediaMode.VIDEO,
+            )
+        ],
+        total_estimated_seconds=5,
+    )
+    rendered = [
+        SceneArtifact(scene_number=1, path=tmp_path / "one.mp4", duration_seconds=5)
+    ]
+
+    cues = build_caption_cues(script, rendered, start_offset_seconds=3)
+
+    assert cues[0].start_seconds == 3
+    assert cues[-1].end_seconds == 8

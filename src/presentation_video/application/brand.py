@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from presentation_video.domain.models import BrandKit, PresentationVisualPlan
+from presentation_video.domain.models import (
+    BrandKit,
+    PresentationVisualPlan,
+    VisualArtifact,
+)
 
 
 def apply_brand_kit(
@@ -39,3 +43,19 @@ def apply_brand_kit(
     return visual_plan.model_copy(
         update={"creative_direction": direction, "scenes": scenes}
     )
+
+
+def apply_brand_images(
+    images: list[VisualArtifact],
+    brand: BrandKit | None,
+) -> list[VisualArtifact]:
+    """Brand opening/closing cards are independent of narrative review assets."""
+    return images
+
+
+def apply_closing_image(
+    images: list[VisualArtifact],
+    brand: BrandKit | None,
+) -> list[VisualArtifact]:
+    """Compatibility wrapper: closing cards are appended after assembly, not to narrative scenes."""
+    return images

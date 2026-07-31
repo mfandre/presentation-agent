@@ -17,6 +17,231 @@ from presentation_video.infrastructure.speech import media_duration
 from presentation_video.infrastructure.visual_media import _local_motion_filter
 
 logger = logging.getLogger(__name__)
+BRAND_CARD_SECONDS = 3.0
+
+
+async def prepend_opening_image(
+    video_path: Path,
+    opening_image_path: Path,
+    output_path: Path,
+    *,
+    visible_seconds: float = BRAND_CARD_SECONDS,
+) -> float:
+    """Prepend a silent full-frame brand card before the narrated presentation."""
+    if not video_path.is_file() or not opening_image_path.is_file():
+        raise FileNotFoundError("Video and opening image must exist before prepending the card")
+    if visible_seconds <= 0:
+        raise ValueError("Opening image duration must be greater than zero")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    filter_complex = (
+        "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,"
+        f"trim=duration={visible_seconds:.3f},setpts=PTS-STARTPTS[openingv];"
+        "[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,"
+        "setpts=PTS-STARTPTS[mainv];"
+        "[openingv][mainv]concat=n=2:v=1:a=0[outv];"
+        "[2:a]asetpts=PTS-STARTPTS[openinga];"
+        "[1:a]aresample=48000,asetpts=PTS-STARTPTS[maina];"
+        "[openinga][maina]concat=n=2:v=0:a=1[outa]"
+    )
+    await run_process(
+        "ffmpeg",
+        "-y",
+        "-loop",
+        "1",
+        "-t",
+        f"{visible_seconds:.3f}",
+        "-i",
+        str(opening_image_path),
+        "-i",
+        str(video_path),
+        "-f",
+        "lavfi",
+        "-t",
+        f"{visible_seconds:.3f}",
+        "-i",
+        "anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[outv]",
+        "-map",
+        "[outa]",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    )
+    return await media_duration(output_path)
+
+
+async def append_closing_image(
+    video_path: Path,
+    closing_image_path: Path,
+    output_path: Path,
+    *,
+    visible_seconds: float = BRAND_CARD_SECONDS,
+) -> float:
+    """Append a silent full-frame brand card after the narrated presentation."""
+    if not video_path.is_file() or not closing_image_path.is_file():
+        raise FileNotFoundError("Video and closing image must exist before appending the end card")
+    if visible_seconds <= 0:
+        raise ValueError("Closing image duration must be greater than zero")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    filter_complex = (
+        "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,setpts=PTS-STARTPTS[mainv];"
+        "[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,"
+        f"trim=duration={visible_seconds:.3f},setpts=PTS-STARTPTS[endv];"
+        "[mainv][endv]concat=n=2:v=1:a=0[outv];"
+        "[0:a]aresample=48000,asetpts=PTS-STARTPTS[maina];"
+        "[2:a]asetpts=PTS-STARTPTS[enda];"
+        "[maina][enda]concat=n=2:v=0:a=1[outa]"
+    )
+    await run_process(
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-loop",
+        "1",
+        "-t",
+        f"{visible_seconds:.3f}",
+        "-i",
+        str(closing_image_path),
+        "-f",
+        "lavfi",
+        "-t",
+        f"{visible_seconds:.3f}",
+        "-i",
+        "anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[outv]",
+        "-map",
+        "[outa]",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    )
+    return await media_duration(output_path)
+
+
+async def overlay_opening_logo(
+    video_path: Path,
+    logo_path: Path,
+    output_path: Path,
+    *,
+    visible_seconds: float = 4,
+) -> None:
+    """Overlay the configured brand mark during the opening without changing audio."""
+    if not video_path.is_file() or not logo_path.is_file():
+        raise FileNotFoundError("Video and opening logo must exist before branding")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fade_out_start = max(visible_seconds - 0.5, 0.5)
+    filter_complex = (
+        "[1:v]scale=280:160:force_original_aspect_ratio=decrease,"
+        "format=rgba,"
+        "fade=t=in:st=0:d=0.4:alpha=1,"
+        f"fade=t=out:st={fade_out_start:.2f}:d=0.5:alpha=1[brand];"
+        "[0:v][brand]overlay=W-w-60:60:"
+        f"enable='between(t,0,{visible_seconds:.2f})'[outv]"
+    )
+    await run_process(
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-loop",
+        "1",
+        "-i",
+        str(logo_path),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[outv]",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-shortest",
+        str(output_path),
+    )
+
+
+async def overlay_video_watermark(
+    video_path: Path,
+    logo_path: Path,
+    output_path: Path,
+    *,
+    position: str = "bottom_right",
+    opacity: float = 0.35,
+    width_percent: int = 10,
+) -> None:
+    """Apply the configured logo watermark to every frame of the assembled video."""
+    if not video_path.is_file() or not logo_path.is_file():
+        raise FileNotFoundError("Video and watermark logo must exist before branding")
+    positions = {
+        "top_left": "48:48",
+        "top_right": "W-w-48:48",
+        "bottom_left": "48:H-h-48",
+        "bottom_right": "W-w-48:H-h-48",
+    }
+    if position not in positions:
+        raise ValueError(f"Unsupported watermark position: {position}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    target_width = round(1920 * width_percent / 100)
+    filter_complex = (
+        f"[1:v]scale={target_width}:-1:force_original_aspect_ratio=decrease,"
+        f"format=rgba,colorchannelmixer=aa={opacity:.3f}[watermark];"
+        f"[0:v][watermark]overlay={positions[position]}[outv]"
+    )
+    await run_process(
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-loop",
+        "1",
+        "-i",
+        str(logo_path),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[outv]",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-shortest",
+        str(output_path),
+    )
 
 
 class FfmpegSceneRenderer(SceneRenderer):

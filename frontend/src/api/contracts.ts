@@ -70,6 +70,10 @@ export interface BrandKit {
   body_font: string;
   visual_style: string;
   image_text_policy: "avoid" | "minimal" | "allowed";
+  watermark_enabled: boolean;
+  watermark_position: "top_left" | "top_right" | "bottom_left" | "bottom_right";
+  watermark_opacity: number;
+  watermark_width_percent: number;
   logo_url: string | null;
   opening_image_url: string | null;
   closing_image_url: string | null;

@@ -2803,6 +2803,12 @@ footer {
 .brand-asset > div { height: 150px; display: grid; place-items: center; overflow: hidden; border-radius: 11px; background: #f3f4f9; color: #868da2; }
 .brand-asset img { width: 100%; height: 100%; object-fit: contain; }
 .brand-asset .secondary-button { display: flex; justify-content: center; margin-top: 4px; }
+.watermark-settings { display: grid; gap: 14px; margin: 2px 0; padding: 16px; border: 1px solid #ddd8f8; border-radius: 14px; background: #faf9ff; }
+.watermark-toggle { display: grid !important; grid-template-columns: auto 1fr; align-items: center; gap: 10px !important; }
+.watermark-toggle input { width: 18px; height: 18px; accent-color: #6048d4; }
+.watermark-toggle > span { display: grid; gap: 2px; }
+.watermark-toggle strong { color: #343a50; }
+.watermark-toggle small { color: #777f92; font-weight: 500; }
 .source-slide-tools { display: grid; gap: 12px; margin-top: 8px; padding-top: 16px; border-top: 1px solid #e2e4ed; }
 .source-slide-tools__heading { display: flex; align-items: center; gap: 8px; color: #353c52; }
 .source-slide-gallery { display: flex; gap: 10px; padding: 4px 2px 10px; overflow-x: auto; }
@@ -2814,4 +2820,60 @@ footer {
 @media (max-width: 850px) {
   .brand-kit-layout { grid-template-columns: 1fr; }
   .brand-kit-page { width: min(100% - 28px, 1240px); padding-top: 36px; }
+}
+
+.workflow-dag {
+  margin: 24px 0;
+  overflow: hidden;
+  border: 1px solid #dce0ec;
+  border-radius: 24px;
+  background: linear-gradient(180deg, #fbfbfe, #f4f5fa);
+  box-shadow: 0 18px 50px rgba(28, 35, 58, .08);
+}
+.workflow-dag__heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 24px 26px 20px; border-bottom: 1px solid #e1e4ee; background: rgba(255,255,255,.78); }
+.workflow-dag__heading > div > span { display: flex; align-items: center; gap: 7px; color: #5b48cf; font-size: .73rem; font-weight: 800; text-transform: uppercase; letter-spacing: .09em; }
+.workflow-dag__heading h2 { margin: 6px 0 0; font-size: 1.35rem; }
+.workflow-dag__heading > small { max-width: 370px; color: #747c91; line-height: 1.5; text-align: right; }
+.workflow-dag__viewport { overflow-x: auto; padding: 30px 28px 40px; }
+.workflow-dag__columns { position: relative; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(260px, 300px); gap: 70px; align-items: stretch; width: max-content; min-width: 100%; }
+.workflow-dag__column { position: relative; display: grid; grid-template-rows: auto 1fr; gap: 12px; }
+.workflow-dag__edges { position: absolute; inset: 0; z-index: 0; overflow: visible; pointer-events: none; }
+.workflow-dag__edge { fill: none; stroke: #aab2c5; stroke-width: 1.7; opacity: .78; }
+.workflow-dag__edge--completed { stroke: #3b9f79; }
+.workflow-dag__edge--running { stroke: #6657e8; stroke-width: 2.3; }
+.workflow-dag__edge--waiting { stroke: #d39a28; }
+.workflow-dag__edge--failed { stroke: #ca4960; }
+.workflow-dag__edge--skipped { stroke: #c9ced9; stroke-dasharray: 5 5; opacity: .45; }
+.workflow-dag__edge--data { stroke-dasharray: 7 6; opacity: .62; }
+.workflow-dag__edges marker path { fill: #929bad; }
+.workflow-dag__level { color: #959caf; font-size: .65rem; font-weight: 800; text-transform: uppercase; letter-spacing: .1em; }
+.workflow-dag__stack { display: flex; flex-direction: column; justify-content: center; gap: 16px; }
+.workflow-dag-node { position: relative; z-index: 1; min-height: 150px; padding: 16px; border: 1px solid #daddE8; border-left: 4px solid #aeb5c7; border-radius: 16px; background: #fff; box-shadow: 0 8px 22px rgba(31,38,61,.07); }
+.workflow-dag-node--conditional { border-color: #d7d0fa; border-left-color: #705bd8; background: linear-gradient(145deg, #fff, #faf9ff); }
+.workflow-dag-node--running { border-left-color: #6657e8; box-shadow: 0 10px 28px rgba(102,87,232,.2); }
+.workflow-dag-node--completed { border-left-color: #2d9e73; }
+.workflow-dag-node--waiting, .workflow-dag-node--checkpoint { border-left-color: #e1a328; }
+.workflow-dag-node--failed { border-left-color: #ce4960; }
+.workflow-dag-node--skipped { color: #9097a8; border-color: #e1e4ec; border-left-color: #b8becb; background: #f7f8fb; box-shadow: none; }
+.workflow-dag-node--skipped > :not(.workflow-dag-node__inlet):not(.workflow-dag-node__outlet) { opacity: .52; filter: grayscale(.45); }
+.workflow-dag-node header { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: start; padding-right: 2px; }
+.workflow-dag-node header small { color: #8a91a3; font-size: .63rem; }
+.workflow-dag-node h3 { margin: 2px 0 0; color: #252c42; font-size: .95rem; line-height: 1.25; }
+.workflow-dag-node > .workflow-status { margin: 12px 0 0 40px; }
+.workflow-condition { display: flex; align-items: center; gap: 5px; margin: -7px -7px 12px; padding: 7px 9px; border-radius: 9px; color: #5945c8; background: #efecff; font-size: .66rem; }
+.workflow-condition span { color: #8b82bf; text-transform: uppercase; font-size: .55rem; font-weight: 800; letter-spacing: .07em; }
+.workflow-condition strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workflow-dag-node__dependencies { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 12px; }
+.workflow-dag-node__dependencies span { padding: 4px 6px; border-radius: 6px; color: #737b90; background: #f0f2f7; font-size: .57rem; }
+.workflow-dag-node__inlet, .workflow-dag-node__outlet { position: absolute; top: 28px; width: 8px; height: 8px; border: 2px solid #fff; border-radius: 50%; background: #9da5ba; box-shadow: 0 0 0 1px #aeb5c7; }
+.workflow-dag-node__inlet { left: -8px; }
+.workflow-dag-node__outlet { right: -8px; }
+.workflow-dag-node .workflow-node__meta { margin-top: 10px; }
+.workflow-dag-node .workflow-node__config { margin-top: 10px; }
+.workflow-legend .legend-line { width: 25px; height: 0; border-top: 2px solid #8f98ad; border-radius: 0; background: transparent; }
+.workflow-legend .legend-line--data { border-top-style: dashed; }
+@media (max-width: 720px) {
+  .workflow-dag__heading { flex-direction: column; }
+  .workflow-dag__heading > small { text-align: left; }
+  .workflow-dag__viewport { padding-inline: 18px; }
 }

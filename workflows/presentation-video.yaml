@@ -152,7 +152,9 @@ steps:
     uses: prompts.compile
     needs: [visual_plan, instructional_design, whiteboard_concept_plan]
     config:
-      continuity: locked
+      continuity: causal_state_locked
+      one_exclusive_action_per_take: true
+      forbid_completed_action_replay: true
       forbid_source_slides_in_cinematic_mode: true
       allow_informational_static_exception: false
 

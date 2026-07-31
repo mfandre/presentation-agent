@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 
 from pydantic import ValidationError
 from pydantic_ai import Agent
@@ -70,6 +71,12 @@ Hybrid editing rules:
   word-free moving shot. No readable words, letters, numbers, captions, logos, signs, documents,
   or presentation pages may appear. Non-readable software interfaces are allowed only when they
   make a source-grounded AI, agent, data-flow, or governance concept visible.
+- For every video scene, populate action_progression with exactly ceil(target_seconds / 8)
+  chronological, mutually exclusive visual actions. Each item is the single physical state change
+  assigned to one downstream take. Start with what happens first and end with the visible outcome.
+  Never repeat an action, reveal a later outcome early, or summarize the whole scene in each item.
+  Example: ["boat enters the water, fish not yet caught", "line tightens and fish is lifted,
+  fish not yet released", "hands release fish and it swims away"].
 - Populate must_show_concepts with the central source concepts that would make the scene misleading
   if omitted. Populate concept_visualization with a concrete account of how each will be visible.
   When the narration says AI agents, do not replace them with generic people, equipment, or sensors:
@@ -90,6 +97,13 @@ Hybrid editing rules:
 
 Continuity rules:
 - Keep recurring people, locations, palette, lighting, era, and art direction coherent.
+- When a person appears in more than one scene, create exactly one stable entry in
+  creative_direction.characters. Give it a short lowercase id and lock concrete, visually
+  observable traits: apparent age range, face shape, skin tone, hair, facial hair, build,
+  wardrobe, accessories, and distinctive identity markers. Never change these traits later.
+- Set recurring_character_ids on every scene where those people appear. Reuse the same id across
+  the complete story; never describe the same recurring person as a new character. Do not add a
+  character profile for anonymous background people who appear only once.
 - The still-image prompt must describe visible subjects, their relationships, setting,
   composition, lighting, and concrete action. Camera movement belongs in camera_motion.
 - Readable interfaces and technical artifacts appear only in unchanged static source pages.
@@ -326,7 +340,11 @@ def validate_sequence(
             if hard_exclusions not in scene.negative_prompt:
                 scene.negative_prompt = f"{hard_exclusions}, {scene.negative_prompt}"
         scene.visual_beats = _normalize_visual_beats(scene, script_scene.target_seconds)
-    plan.creative_direction = script.creative_direction
+    # Narrative direction remains authoritative, while the visual planner owns the cast bible
+    # because it is the stage that turns recurring roles into concrete on-screen identities.
+    plan.creative_direction = script.creative_direction.model_copy(
+        update={"characters": plan.creative_direction.characters}
+    )
 
 
 # Backwards-compatible alias for integrations that imported the former private helper.
@@ -335,7 +353,15 @@ _validate_sequence = validate_sequence
 
 def _plan_issues(plan: PresentationVisualPlan, script: PresentationScript) -> list[str]:
     issues: list[str] = []
+    character_ids = {character.id for character in plan.creative_direction.characters}
+    scripts = {scene.scene_number: scene for scene in script.scenes}
     for scene in plan.scenes:
+        unknown_characters = set(scene.recurring_character_ids) - character_ids
+        if unknown_characters:
+            issues.append(
+                f"scene {scene.scene_number} references undefined recurring characters: "
+                f"{', '.join(sorted(unknown_characters))}"
+            )
         if not scene.scene_purpose.strip():
             issues.append(f"scene {scene.scene_number} has no scene_purpose")
         if not scene.relationship_to_thesis.strip():
@@ -351,6 +377,14 @@ def _plan_issues(plan: PresentationVisualPlan, script: PresentationScript) -> li
                 f"video scene {scene.scene_number} has no forbidden_substitutions to prevent "
                 "a generic visual"
             )
+        if scene.media_mode == MediaMode.VIDEO:
+            required_actions = math.ceil(scripts[scene.scene_number].target_seconds / 8)
+            if len(scene.action_progression) != required_actions:
+                issues.append(
+                    f"video scene {scene.scene_number} requires exactly {required_actions} "
+                    f"chronological action_progression items, found "
+                    f"{len(scene.action_progression)}"
+                )
     return issues
 
 

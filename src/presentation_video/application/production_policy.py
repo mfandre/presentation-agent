@@ -38,7 +38,31 @@ def enforce_cinematic_script(script: PresentationScript) -> PresentationScript:
 def enforce_cinematic_visual_plan(
     plan: PresentationVisualPlan,
 ) -> PresentationVisualPlan:
+    characters = {character.id: character for character in plan.creative_direction.characters}
+
     def adapt(scene):
+        scene_characters = [
+            characters[character_id]
+            for character_id in scene.recurring_character_ids
+            if character_id in characters
+        ]
+        character_contract = ""
+        if scene_characters:
+            locked_profiles = " | ".join(
+                (
+                    f"{character.id}: role={character.narrative_role}; "
+                    f"appearance={character.physical_appearance}; wardrobe={character.wardrobe}; "
+                    f"identity markers={', '.join(character.identity_markers) or 'none'}"
+                )
+                for character in scene_characters
+            )
+            character_contract = (
+                " LOCKED CHARACTER BIBLE: "
+                f"{locked_profiles}. These are the same recurring people seen earlier and later. "
+                "Preserve their facial structure, apparent age, skin tone, hair, body type, "
+                "wardrobe, accessories, and identity markers exactly. Do not cast a different "
+                "person, redesign the wardrobe, or merge identities."
+            )
         return scene.model_copy(
             update={
                 "media_mode": MediaMode.VIDEO,
@@ -59,6 +83,7 @@ def enforce_cinematic_visual_plan(
                 "prompt": (
                     f"{scene.prompt} Original cinematic shot only. No slide, page, "
                     "document, presentation layout, readable text, caption, or interface."
+                    f"{character_contract}"
                 ),
             }
         )

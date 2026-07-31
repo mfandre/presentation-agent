@@ -16,6 +16,78 @@ from presentation_video.infrastructure.video import FfmpegSceneRenderer
 
 
 @pytest.mark.asyncio
+async def test_opening_image_is_prepended_before_narration_with_silence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    video_path = tmp_path / "presentation.mp4"
+    video_path.write_bytes(b"video")
+    opening_path = tmp_path / "opening.png"
+    opening_path.write_bytes(b"image")
+    output_path = tmp_path / "with-opening.mp4"
+    captured: list[str] = []
+
+    async def fake_process(*args: str, **kwargs: object) -> str:
+        captured.extend(args)
+        output_path.write_bytes(b"result")
+        return ""
+
+    async def fake_duration(path: Path) -> float:
+        assert path == output_path
+        return 63
+
+    monkeypatch.setattr(video, "run_process", fake_process)
+    monkeypatch.setattr(video, "media_duration", fake_duration)
+
+    duration = await video.prepend_opening_image(
+        video_path,
+        opening_path,
+        output_path,
+        visible_seconds=3,
+    )
+
+    assert duration == 63
+    assert captured[captured.index("-i") + 1] == str(opening_path)
+    assert "anullsrc=channel_layout=stereo:sample_rate=48000" in captured
+    assert any("[openingv][mainv]concat" in argument for argument in captured)
+
+
+@pytest.mark.asyncio
+async def test_closing_image_is_appended_after_narration_with_silence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    video_path = tmp_path / "presentation.mp4"
+    video_path.write_bytes(b"video")
+    closing_path = tmp_path / "closing.png"
+    closing_path.write_bytes(b"image")
+    output_path = tmp_path / "with-closing.mp4"
+    captured: list[str] = []
+
+    async def fake_process(*args: str, **kwargs: object) -> str:
+        captured.extend(args)
+        output_path.write_bytes(b"result")
+        return ""
+
+    async def fake_duration(path: Path) -> float:
+        assert path == output_path
+        return 63
+
+    monkeypatch.setattr(video, "run_process", fake_process)
+    monkeypatch.setattr(video, "media_duration", fake_duration)
+
+    duration = await video.append_closing_image(
+        video_path,
+        closing_path,
+        output_path,
+        visible_seconds=3,
+    )
+
+    assert duration == 63
+    assert "anullsrc=channel_layout=stereo:sample_rate=48000" in captured
+    assert any("trim=duration=3.000" in argument for argument in captured)
+    assert captured[captured.index("-map") + 1] == "[outv]"
+
+
+@pytest.mark.asyncio
 async def test_video_scene_loops_at_original_speed_and_is_trimmed_to_audio(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

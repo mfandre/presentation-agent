@@ -84,6 +84,33 @@ def _story_function(index: int, total: int, story_beat: str) -> str:
     return "develop_argument"
 
 
+def _visual_progression(index: int, total: int) -> str:
+    if total == 1:
+        return (
+            "Use one decisive medium-wide composition that captures the exact narrated action "
+            "without summarizing earlier or later events."
+        )
+    if index == 0:
+        return (
+            "Use a wide establishing composition and show the initial state or the beginning of "
+            "the action. Do not reveal the outcome yet."
+        )
+    if index == total - 1:
+        return (
+            "Use a clearly new resolving composition, wider or reverse-angle, showing the visible "
+            "outcome of this excerpt and a clean transition forward."
+        )
+    if index % 2:
+        return (
+            "Cut to a medium action view from a new angle. Show the next physical action in this "
+            "excerpt, not the established view and not the final outcome."
+        )
+    return (
+        "Cut to a close evidence-rich detail of the object, hands, expression, or consequence "
+        "named in this excerpt. Do not reuse the previous camera position."
+    )
+
+
 def compile_shots(
     scene: VisualScenePlan,
     script: SceneScript,
@@ -97,6 +124,14 @@ def compile_shots(
         raise ValueError("maximum shot duration must be between 0 and 8 seconds")
     shot_count = max(1, math.ceil(duration_seconds / maximum_shot_seconds))
     excerpts = _split_semantic_units(script.narration, shot_count)
+    action_steps = (
+        scene.action_progression
+        if len(scene.action_progression) == shot_count
+        else [
+            f"Show only the physical event described by this narration excerpt: {excerpt}"
+            for excerpt in excerpts
+        ]
+    )
     base_duration = duration_seconds / shot_count
     shots: list[VisualShotPlan] = []
     cursor = 0.0
@@ -105,20 +140,33 @@ def compile_shots(
         duration = duration_seconds - cursor if index == shot_count - 1 else round(base_duration, 3)
         duration = round(min(max(duration, 0.1), maximum_shot_seconds), 3)
         story_function = _story_function(index, shot_count, scene.story_beat)
+        progression = _visual_progression(index, shot_count)
+        action_now = action_steps[index]
+        completed_actions = action_steps[:index]
         next_state = (
-            f"shot {index + 1} completes {story_function} and leaves visible momentum "
-            f"toward shot {index + 2 if index + 1 < shot_count else 'the next scene'}"
+            f"After shot {index + 1}, this action is complete: {action_now}. "
+            "The next shot must continue from this visible state without reenacting it."
         )
         prompt = (
-            f"{scene.prompt}\n"
+            f"STATE BEFORE THIS SHOT: {previous_state}.\n"
+            f"EXCLUSIVE ACTION NOW: {action_now}.\n"
+            f"ALREADY COMPLETED — NEVER REPEAT: "
+            f"{'; '.join(completed_actions) or 'nothing; this is the first action'}.\n"
+            f"REQUIRED END STATE: {next_state}\n"
             f"NARRATION NOW: {excerpts[index]}\n"
             f"SHOT FUNCTION: {story_function}.\n"
+            f"VISUAL PROGRESSION: {progression}\n"
             f"REQUIRED CONCEPTS: {', '.join(scene.must_show_concepts) or 'source-grounded action'}.\n"
-            f"CONTINUITY IN: {previous_state}.\n"
-            f"CONTINUITY OUT: {next_state}.\n"
+            f"SCENE WORLD AND CAST REFERENCE: {scene.prompt}\n"
             "Create one distinct cinematic shot at natural speed. Show a concrete action that "
-            "visibly expresses this exact narration excerpt. Preserve recurring people, setting, "
-            "era, wardrobe, palette, lighting, materials, and screen direction from continuity. "
+            "visibly expresses EXCLUSIVE ACTION NOW and reaches REQUIRED END STATE exactly once. "
+            "The scene-world reference defines setting, cast, props, palette, and style only. "
+            "Ignore its action verbs, pose, and completed outcome whenever they conflict with the "
+            "exclusive action assigned above. Preserve recurring people, era, wardrobe, palette, "
+            "lighting, materials, and screen direction, while changing shot size, camera position, "
+            "pose, staging, and moment according to VISUAL PROGRESSION. Begin from STATE BEFORE "
+            "THIS SHOT; never reset the story, repeat an already completed action, copy the previous "
+            "frame's composition, or reveal a future action early. "
             "No slide, page, document, presentation layout, readable text, caption, interface, "
             "logo, watermark, montage, split screen, or loop."
         )
@@ -167,6 +215,12 @@ def validate_shots(shots: list[VisualShotPlan], duration_seconds: float) -> None
                 raise ValueError("cinematic prompt requests a forbidden source slide")
         if shot.required_concepts and "REQUIRED CONCEPTS:" not in shot.prompt:
             raise ValueError("shot prompt omits its required concepts")
+        if "VISUAL PROGRESSION:" not in shot.prompt:
+            raise ValueError("cinematic shot prompt omits its distinct visual progression")
+        if "EXCLUSIVE ACTION NOW:" not in shot.prompt:
+            raise ValueError("cinematic shot prompt omits its exclusive chronological action")
+        if "ALREADY COMPLETED — NEVER REPEAT:" not in shot.prompt:
+            raise ValueError("cinematic shot prompt omits completed-action continuity")
         cursor += shot.duration_seconds
     if abs(cursor - duration_seconds) > 0.05:
         raise ValueError("shots do not cover the complete narration duration")

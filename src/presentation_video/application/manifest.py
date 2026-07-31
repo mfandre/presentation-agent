@@ -15,6 +15,7 @@ def write_job_manifest(
     captions_srt_path: Path,
     caption_cue_count: int,
     scenes: list[SceneArtifact],
+    caption_start_offset_seconds: float = 0,
 ) -> Path:
     manifest = {
         "job_id": prepared.job_id,
@@ -32,6 +33,29 @@ def write_job_manifest(
             if prepared.request.brand_kit
             else None
         ),
+        "brand_assets_applied": {
+            "opening_logo": bool(
+                prepared.request.brand_kit
+                and prepared.request.brand_kit.logo_path
+                and prepared.request.brand_kit.logo_path.is_file()
+            ),
+            "opening_image": bool(
+                prepared.request.brand_kit
+                and prepared.request.brand_kit.opening_image_path
+                and prepared.request.brand_kit.opening_image_path.is_file()
+            ),
+            "watermark": bool(
+                prepared.request.brand_kit
+                and prepared.request.brand_kit.watermark_enabled
+                and prepared.request.brand_kit.logo_path
+                and prepared.request.brand_kit.logo_path.is_file()
+            ),
+            "closing_image": bool(
+                prepared.request.brand_kit
+                and prepared.request.brand_kit.closing_image_path
+                and prepared.request.brand_kit.closing_image_path.is_file()
+            ),
+        },
         "approved_images": [
             image.model_dump(mode="json") for image in prepared.visual_images
         ],
@@ -42,6 +66,7 @@ def write_job_manifest(
             "vtt": str(captions_vtt_path),
             "srt": str(captions_srt_path),
             "cue_count": caption_cue_count,
+            "start_offset_seconds": caption_start_offset_seconds,
         },
         "scenes": [scene.model_dump(mode="json") for scene in scenes],
     }

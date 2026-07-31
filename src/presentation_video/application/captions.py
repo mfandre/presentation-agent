@@ -38,9 +38,13 @@ def _split_caption_units(text: str, maximum_words: int = 12) -> list[str]:
 def build_caption_cues(
     script: PresentationScript,
     scenes: list[SceneArtifact],
+    *,
+    start_offset_seconds: float = 0,
 ) -> list[CaptionCue]:
+    if start_offset_seconds < 0:
+        raise ValueError("caption start offset cannot be negative")
     scripts = {scene.scene_number: scene for scene in script.scenes}
-    cursor = 0.0
+    cursor = start_offset_seconds
     cues: list[CaptionCue] = []
     for rendered in sorted(scenes, key=lambda scene: scene.scene_number):
         narration = scripts[rendered.scene_number].narration

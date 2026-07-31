@@ -205,6 +205,8 @@ class _MalformedThenValidClient:
             '"media_mode":"video","scene_purpose":"Show distributed agent autonomy",'
             '"relationship_to_thesis":"Agents replace centralized assistance with specialized '
             'autonomy","narrative_progress":"Demonstrate the target operating model",'
+            '"action_progression":["separate agents receive distinct tasks",'
+            '"agents use their tools and hand results to human oversight"],'
             '"visible_evidence":["separate agent modules use distinct tools"],'
             '"forbidden_substitutions":["generic industrial worker"]}]}'
         )

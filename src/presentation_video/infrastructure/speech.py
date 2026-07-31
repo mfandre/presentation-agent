@@ -28,14 +28,27 @@ async def media_duration(path: Path) -> float:
         "-v",
         "error",
         "-show_entries",
-        "format=duration",
+        "format=duration:stream=codec_type,duration,duration_ts,time_base,nb_frames,avg_frame_rate",
         "-of",
         "json",
         str(path),
     )
-    duration = float(json.loads(output)["format"]["duration"])
+    payload = json.loads(output)
+    candidates = [payload.get("format", {}).get("duration")]
+    candidates.extend(stream.get("duration") for stream in payload.get("streams", []))
+    duration = next(
+        (
+            float(candidate)
+            for candidate in candidates
+            if candidate not in {None, "", "N/A"} and float(candidate) > 0
+        ),
+        0.0,
+    )
     if duration <= 0:
-        raise RuntimeError(f"Invalid media duration for {path}")
+        raise RuntimeError(
+            f"Media has no measurable audio/video duration: {path}. "
+            f"ffprobe format={payload.get('format', {})} streams={payload.get('streams', [])}"
+        )
     return duration
 
 

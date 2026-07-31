@@ -25,13 +25,21 @@ async def compose_shot_clips(
             raise ValueError(
                 f"visual QA failed for scene {scene_number}, shot {artifact.shot_number}"
             )
-        actual_duration = await media_duration(artifact.path)
-        if actual_duration <= 0:
-            raise ValueError(
-                f"visual QA found an empty clip for scene {scene_number}, "
-                f"shot {artifact.shot_number}"
+        if artifact.kind == "image":
+            # Brand opening/closing frames and approved informational takes are intentionally
+            # static. Give them the planned shot duration instead of probing an image as a movie.
+            actual_duration = duration
+            input_args.extend(
+                ["-loop", "1", "-t", f"{duration:.3f}", "-i", str(artifact.path)]
             )
-        input_args.extend(["-i", str(artifact.path)])
+        else:
+            actual_duration = await media_duration(artifact.path)
+            if actual_duration <= 0:
+                raise ValueError(
+                    f"visual QA found an empty clip for scene {scene_number}, "
+                    f"shot {artifact.shot_number}"
+                )
+            input_args.extend(["-i", str(artifact.path)])
         filters.append(
             f"[{index}:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
             "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,"

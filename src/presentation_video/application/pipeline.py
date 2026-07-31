@@ -15,6 +15,7 @@ from presentation_video.domain.models import (
     ProductionMode,
     PreparedVideoJob,
     SceneArtifact,
+    SlideContent,
     VideoJobRequest,
     VideoJobResult,
     VisualArtifact,
@@ -36,7 +37,7 @@ from presentation_video.domain.ports import (
     VisualPlanner,
 )
 from presentation_video.application.cinematic import compile_shots, materialize_shot
-from presentation_video.application.brand import apply_brand_kit
+from presentation_video.application.brand import apply_brand_images, apply_brand_kit
 from presentation_video.application.captions import build_caption_cues, write_caption_files
 from presentation_video.application.audio_cache import valid_wav_duration as _valid_wav_duration
 from presentation_video.application.manifest import write_job_manifest
@@ -70,6 +71,13 @@ from presentation_video.application.whiteboard_states import (
 )
 from presentation_video.infrastructure.video_sequence import (
     compose_shot_clips as _compose_shot_clips,
+)
+from presentation_video.infrastructure.video import (
+    BRAND_CARD_SECONDS,
+    append_closing_image,
+    overlay_opening_logo,
+    overlay_video_watermark,
+    prepend_opening_image,
 )
 from presentation_video.infrastructure.visual_planning import validate_sequence
 
@@ -348,13 +356,34 @@ class CreatePresentationVideo:
             )
             completed_images = 0
 
-            async def generate_image(scene_number: int, shot_number: int = 1) -> VisualArtifact:
+            async def generate_image(
+                scene_number: int,
+                shot_number: int = 1,
+                identity_reference: Path | None = None,
+            ) -> VisualArtifact:
                 nonlocal completed_images
                 async with self._image_semaphore:
                     scene_script = scripts[scene_number]
                     scene_sources = [
                         source_slides[number] for number in scene_script.source_slide_numbers
                     ]
+                    if identity_reference is not None and identity_reference.is_file():
+                        scene_sources.insert(
+                            0,
+                            SlideContent(
+                                number=1,
+                                title="Character identity reference — not a source page",
+                                body_text=(
+                                    "Use this generated frame only to preserve recurring character "
+                                    "identity, facial structure, wardrobe, and distinguishing "
+                                    "features. It is not a composition reference. Do not copy its "
+                                    "pose, action, camera angle, framing, background, object layout, "
+                                    "or moment in time. Follow the current shot prompt for action, "
+                                    "setting, shot size, composition, and camera."
+                                ),
+                                image_path=identity_reference,
+                            ),
+                        )
                     logger.info(
                         "job=%s visual frame preparation started scene=%s media_mode=%s "
                         "source_pages=%s",
@@ -471,12 +500,40 @@ class CreatePresentationVideo:
                 )
                 images = [image for group in state_groups for image in group]
             else:
-                images = await asyncio.gather(
-                    *(
-                        generate_image(scene_number, shot_number)
-                        for scene_number, shot_number in image_tasks
+                if request.production_mode == ProductionMode.CINEMATIC_STORY:
+                    # A generated identity reference is more effective than prose alone. Generate
+                    # cinematic frames in story order and pass the preceding approved frame into
+                    # the next request so recurring people are not independently recast.
+                    images = []
+                    character_references: dict[str, Path] = {}
+                    for scene_number, shot_number in image_tasks:
+                        character_ids = plans[scene_number].recurring_character_ids
+                        identity_reference = next(
+                            (
+                                character_references[character_id]
+                                for character_id in character_ids
+                                if character_id in character_references
+                            ),
+                            None,
+                        )
+                        image = await generate_image(
+                            scene_number,
+                            shot_number,
+                            identity_reference=identity_reference,
+                        )
+                        images.append(image)
+                        for character_id in character_ids:
+                            # Keep one canonical identity anchor. Chaining every generated frame
+                            # causes pose, framing, and scenery to drift into the next take.
+                            character_references.setdefault(character_id, image.path)
+                else:
+                    images = await asyncio.gather(
+                        *(
+                            generate_image(scene_number, shot_number)
+                            for scene_number, shot_number in image_tasks
+                        )
                     )
-                )
+            images = apply_brand_images(images, request.brand_kit)
             prepared = PreparedVideoJob(
                 job_id=job_id,
                 request=request,
@@ -651,7 +708,11 @@ class CreatePresentationVideo:
                     shot = scene_plan.shots[shot_number - 1] if scene_plan.shots else None
                     plan = materialize_shot(scene_plan, shot) if shot else scene_plan
                     image = images[(scene_number, shot_number)]
-                    if plan.media_mode == MediaMode.STATIC or image.source_slide_number is not None:
+                    if (
+                        plan.media_mode == MediaMode.STATIC
+                        or image.source_slide_number is not None
+                        or image.locked_static
+                    ):
                         clip = image
                         logger.info(
                             "job=%s image-to-video skipped scene=%s shot=%s reason=static_or_source_image",
@@ -837,12 +898,58 @@ class CreatePresentationVideo:
             )
             video_path = prepared.output_dir / "presentation.mp4"
             duration = await self._video_assembler.assemble(scenes, video_path)
+            brand = prepared.request.brand_kit
+            caption_offset_seconds = 0.0
+            if (
+                brand
+                and brand.opening_image_path
+                and brand.opening_image_path.is_file()
+            ):
+                opening_path = prepared.output_dir / "presentation-with-opening.mp4"
+                duration = await prepend_opening_image(
+                    video_path,
+                    brand.opening_image_path,
+                    opening_path,
+                )
+                opening_path.replace(video_path)
+                caption_offset_seconds = BRAND_CARD_SECONDS
+            if (
+                brand
+                and brand.closing_image_path
+                and brand.closing_image_path.is_file()
+            ):
+                closing_path = prepared.output_dir / "presentation-with-closing.mp4"
+                duration = await append_closing_image(
+                    video_path,
+                    brand.closing_image_path,
+                    closing_path,
+                )
+                closing_path.replace(video_path)
+            if brand and brand.logo_path and brand.logo_path.is_file():
+                branded_path = prepared.output_dir / "presentation-branded.mp4"
+                await overlay_opening_logo(video_path, brand.logo_path, branded_path)
+                branded_path.replace(video_path)
+                if brand.watermark_enabled:
+                    watermarked_path = prepared.output_dir / "presentation-watermarked.mp4"
+                    await overlay_video_watermark(
+                        video_path,
+                        brand.logo_path,
+                        watermarked_path,
+                        position=brand.watermark_position,
+                        opacity=brand.watermark_opacity,
+                        width_percent=brand.watermark_width_percent,
+                    )
+                    watermarked_path.replace(video_path)
             await self._reporter.update(
                 job_id,
                 JobStatus.CAPTIONING,
                 "Gerando legendas WebVTT e SRT",
             )
-            caption_cues = build_caption_cues(prepared.script, scenes)
+            caption_cues = build_caption_cues(
+                prepared.script,
+                scenes,
+                start_offset_seconds=caption_offset_seconds,
+            )
             captions_vtt_path, captions_srt_path = write_caption_files(
                 caption_cues,
                 prepared.output_dir,
@@ -863,6 +970,7 @@ class CreatePresentationVideo:
                 captions_srt_path=captions_srt_path,
                 caption_cue_count=len(caption_cues),
                 scenes=scenes,
+                caption_start_offset_seconds=caption_offset_seconds,
             )
             await self._reporter.update(job_id, JobStatus.COMPLETED)
             return VideoJobResult(
