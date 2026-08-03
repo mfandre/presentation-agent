@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 from presentation_video.application.cinematic import MAX_SHOT_SECONDS, _split_semantic_units
+from presentation_video.application.content_audit import assign_information_to_shots
 from presentation_video.domain.models import (
     MotionPreset,
     SceneScript,
@@ -44,6 +45,8 @@ def compile_whiteboard_shots(
             "NARRATION NOW is semantic guidance only. Never copy, spell, trace, write, or display "
             "any part of it on the board. Do not animate handwriting or character formation. "
             "Create one progressive whiteboard draw-on take for exactly this narration excerpt. "
+            "This take may add only one small coherent cluster of adjacent strokes. Never combine "
+            "multiple drawing ideas, distant board regions, or separate actions in the same take. "
             "The supplied approved image is the exact cumulative END STATE for this take. Begin "
             "from BOARD STATE IN and finish on the supplied image without changing its composition. "
             "Preserve every useful line already present in BOARD STATE IN, then add only the next "
@@ -97,6 +100,11 @@ def compile_whiteboard_shots(
         )
         cursor = round(cursor + duration, 3)
         previous_state = next_state
+    shots = assign_information_to_shots(
+        shots,
+        script.critical_information,
+        preserve_source_frame=False,
+    )
     validate_whiteboard_shots(shots, duration_seconds)
     return shots
 
@@ -115,7 +123,10 @@ def validate_whiteboard_shots(
             raise ValueError("whiteboard takes cannot exceed 8 seconds")
         if abs(shot.start_seconds - cursor) > 0.02:
             raise ValueError("whiteboard take timeline contains a gap or overlap")
-        if "BOARD STATE IN:" not in shot.prompt or "NARRATION NOW:" not in shot.prompt:
+        if (
+            not shot.locked_static
+            and ("BOARD STATE IN:" not in shot.prompt or "NARRATION NOW:" not in shot.prompt)
+        ):
             raise ValueError("whiteboard take prompt lacks narration or board continuity")
         cursor += shot.duration_seconds
     if abs(cursor - duration_seconds) > 0.05:

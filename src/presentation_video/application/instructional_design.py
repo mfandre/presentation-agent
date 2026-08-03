@@ -12,25 +12,74 @@ from presentation_video.domain.models import (
     VisualScenePlan,
 )
 
+_SYSTEM_DEMO_EVIDENCE = (
+    "screenshot",
+    "screen capture",
+    "captura de tela",
+    "source screen",
+    "actual interface",
+    "interface real",
+    "tela do sistema",
+    "tela do portal",
+    "passo a passo no sistema",
+    "campo de formulário",
+    "form field",
+)
+
+_SYSTEM_CLICK_INSTRUCTIONS = (
+    "clique",
+    "click",
+    "toque no botão",
+    "tap the button",
+    "selecione o menu",
+    "select the menu",
+    "preencha o campo",
+    "fill in the field",
+)
+
+_PROCESS_ACTION_SIGNALS = (
+    "processo",
+    "process",
+    "fluxo",
+    "flow",
+    "procedimento",
+    "procedure",
+    "etapa",
+    "step",
+    "registrar",
+    "registre",
+    "register",
+    "enviar",
+    "envio",
+    "submit",
+    "aprovar",
+    "aprovação",
+    "approve",
+    "approval",
+    "pagar",
+    "pagamento",
+    "payment",
+    "digitalizar",
+    "digitalizando",
+    "scan",
+)
+
+_BEHAVIOR_ACTION_SIGNALS = (
+    "comportamento",
+    "behavior",
+    "conduta",
+    "conduct",
+    "situação",
+    "scenario",
+    "exemplo",
+    "example",
+    "colaborador",
+    "employee",
+    "gestor",
+    "manager",
+)
+
 _SIGNALS: tuple[tuple[InstructionalContentType, tuple[str, ...]], ...] = (
-    (
-        InstructionalContentType.SYSTEM_DEMO,
-        (
-            "interface",
-            "portal",
-            "aplicativo",
-            "application",
-            "tela",
-            "screen",
-            "clique",
-            "click",
-            "menu",
-            "campo de formulário",
-            "form field",
-            "botão",
-            "button",
-        ),
-    ),
     (
         InstructionalContentType.RULE,
         (
@@ -121,10 +170,30 @@ def classify_instructional_scene(
     narration: str,
 ) -> InstructionalContentType:
     text = _normalized_scene_text(scene, narration)
+    if any(signal in text for signal in _SYSTEM_DEMO_EVIDENCE) or any(
+        instruction in text for instruction in _SYSTEM_CLICK_INSTRUCTIONS
+    ):
+        return InstructionalContentType.SYSTEM_DEMO
+    if sum(signal in text for signal in _PROCESS_ACTION_SIGNALS) >= 2:
+        return InstructionalContentType.PROCESS
     for content_type, signals in _SIGNALS:
         if any(signal in text for signal in signals):
             return content_type
     return InstructionalContentType.CONCEPT
+
+
+def _dynamic_candidate(
+    scene: VisualScenePlan,
+    narration: str,
+) -> tuple[InstructionalContentType, int]:
+    text = _normalized_scene_text(scene, narration)
+    process_score = sum(signal in text for signal in _PROCESS_ACTION_SIGNALS)
+    behavior_score = sum(signal in text for signal in _BEHAVIOR_ACTION_SIGNALS)
+    if process_score >= behavior_score and process_score:
+        return InstructionalContentType.PROCESS, process_score
+    if behavior_score:
+        return InstructionalContentType.BEHAVIOR, behavior_score
+    return InstructionalContentType.BEHAVIOR, 0
 
 
 def _generated_training_still(
@@ -267,6 +336,33 @@ def direct_corporate_training_plan(
             continue
         directed.append(_generated_training_scene(scene, content_type, identity))
         previous_was_static = False
+    requires_dynamic_instruction = script.total_estimated_seconds > 30
+    has_dynamic_instruction = any(
+        scene.media_mode == MediaMode.VIDEO
+        and scene.instructional_type
+        in {InstructionalContentType.PROCESS, InstructionalContentType.BEHAVIOR}
+        for scene in directed
+    )
+    if requires_dynamic_instruction and not has_dynamic_instruction:
+        candidates = []
+        for index, scene in enumerate(plan.scenes):
+            candidate_type, score = _dynamic_candidate(
+                scene,
+                scripts[scene.scene_number].narration,
+            )
+            # Preserve a real system demonstration when another scene can carry motion.
+            system_penalty = (
+                1
+                if directed[index].instructional_type == InstructionalContentType.SYSTEM_DEMO
+                else 0
+            )
+            candidates.append((system_penalty, -score, -index, index, candidate_type))
+        _, _, _, selected_index, selected_type = min(candidates)
+        directed[selected_index] = _generated_training_scene(
+            plan.scenes[selected_index],
+            selected_type,
+            identity,
+        )
     return plan.model_copy(update={"scenes": directed})
 
 

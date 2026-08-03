@@ -79,6 +79,9 @@ Hybrid editing rules:
   fish not yet released", "hands release fish and it swims away"].
 - Populate must_show_concepts with the central source concepts that would make the scene misleading
   if omitted. Populate concept_visualization with a concrete account of how each will be visible.
+- Copy every critical_information item supplied by the narrative scene. An item with
+  exact_display_required=true must receive an exact static information anchor; never ask an image
+  or video model to rewrite its values, roles, deadlines, or table cells.
   When the narration says AI agents, do not replace them with generic people, equipment, or sensors:
   visibly show multiple software task modules, tool handoffs, orchestration, and human oversight.
 - Depict AI as credible software workflow, never as a robot, humanoid, glowing brain, magic orb,
@@ -104,6 +107,9 @@ Continuity rules:
 - Set recurring_character_ids on every scene where those people appear. Reuse the same id across
   the complete story; never describe the same recurring person as a new character. Do not add a
   character profile for anonymous background people who appear only once.
+- When a scene contains dialogue, stage the named speaker and listeners as those matching recurring
+  characters. Preserve speaking order, emotion, eye-lines, and natural reactions; never render the
+  spoken words as visible text.
 - The still-image prompt must describe visible subjects, their relationships, setting,
   composition, lighting, and concrete action. Camera movement belongs in camera_motion.
 - Readable interfaces and technical artifacts appear only in unchanged static source pages.
@@ -264,7 +270,11 @@ def _payload(document: PresentationDocument, script: PresentationScript) -> dict
                     for number in item.source_slide_numbers
                 ],
                 "narration": item.narration,
+                "dialogue": [line.model_dump(mode="json") for line in item.dialogue],
                 "duration_seconds": item.target_seconds,
+                "critical_information": [
+                    unit.model_dump(mode="json") for unit in item.critical_information
+                ],
             }
             for item in script.scenes
         ],
@@ -291,6 +301,7 @@ def validate_sequence(
             script_scene.relationship_to_thesis or scene.relationship_to_thesis
         )
         scene.narrative_progress = script_scene.narrative_progress or scene.narrative_progress
+        scene.critical_information = list(script_scene.critical_information)
         inferred_concepts = infer_required_concepts(
             f"{script_scene.narration} {script_scene.visual_intent} {scene.prompt}"
         )

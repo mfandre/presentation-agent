@@ -91,8 +91,19 @@ def build_pipeline(
     image_config = runtime.step("generate_images")
     speech_config = runtime.step("speech")
     video_config = runtime.step("animate")
+    whiteboard_video_config = runtime.step("whiteboard_animate")
     scene_plan_config = runtime.raw("scene_plan")
     duration_config = runtime.raw("duration_validate")
+    storyboard_config = runtime.optional("storyboard")
+    whiteboard_states_config = runtime.raw("whiteboard_states")
+    content_audit_config = runtime.optional("content_audit")
+    critical_information_signals = tuple(
+        str(value)
+        for value in content_audit_config.get(
+            "signals",
+            ["approval_matrix", "deadlines", "exact_numbers", "tables"],
+        )
+    )
     allow_duration_review = bool(duration_config.get("checkpoint_when_over_limit", True))
     maximum_shot_seconds = float(scene_plan_config.get("maximum_shot_seconds", 8))
 
@@ -137,10 +148,27 @@ def build_pipeline(
             max_parallel_images=runtime.parallelism("generate_images"),
             max_parallel_speech=runtime.parallelism("speech"),
             max_parallel_animations=runtime.parallelism("animate"),
+            whiteboard_max_parallel_animations=runtime.parallelism("whiteboard_animate"),
             max_parallel_renders=runtime.parallelism("render"),
             maximum_shot_seconds=maximum_shot_seconds,
             duration_tolerance_percent=float(duration_config.get("tolerance_percent", 5)),
             words_per_minute=int(duration_config.get("words_per_minute", 155)),
+            storyboard_enabled=bool(storyboard_config.get("enabled", True)),
+            storyboard_panel_seconds=float(storyboard_config.get("panel_seconds", 3)),
+            storyboard_panels_per_sheet=int(
+                storyboard_config.get("panels_per_sheet", 9)
+            ),
+            whiteboard_target_take_seconds=float(
+                whiteboard_states_config.get("target_take_seconds", 2)
+            ),
+            dialogue_voices=tuple(
+                str(voice)
+                for voice in runtime.raw("speech").get(
+                    "dialogue_voices",
+                    ["Kore", "Puck", "Aoede", "Charon", "Fenrir", "Leda", "Orus", "Zephyr"],
+                )
+            ),
+            critical_information_signals=critical_information_signals,
         )
     if image_config.provider == "slide" and video_config.provider in {
         "gemini_omni",
@@ -158,6 +186,7 @@ def build_pipeline(
     if (
         image_config.provider == "vertex_ai"
         or video_config.provider == "vertex_ai"
+        or whiteboard_video_config.provider == "vertex_ai"
         or speech_config.provider == "vertex_ai"
     ):
         vertex_client_factory = VertexClientFactory(
@@ -220,6 +249,7 @@ def build_pipeline(
             replicate_client(image_config),
             image_config.model,
             image_config.model_input,
+            str(runtime.raw("generate_images").get("reference_input_key", "input_images")),
         )
     elif image_config.provider == "vertex_ai":
         assert vertex_client_factory is not None
@@ -235,53 +265,54 @@ def build_pipeline(
     else:
         raise ValueError("generate_images.provider must be 'slide', 'replicate', or 'vertex_ai'")
 
-    video_clip_generator: VideoClipGenerator
-    if video_config.provider == "ffmpeg":
-        video_clip_generator = FfmpegImageAnimator()
-    elif video_config.provider == "replicate":
-        if not video_config.model:
-            raise ValueError("animate.model is required for Replicate video generation")
-        video_clip_generator = ReplicateVideoAssetGenerator(
-            replicate_client(video_config),
-            video_config.model,
-            str(runtime.raw("animate").get("image_input_key", "image")),
-            video_config.model_input,
-        )
-    elif video_config.provider == "vertex_ai":
-        assert vertex_client_factory is not None
-        video_clip_generator = VertexVideoAssetGenerator(
-            vertex_client_factory.client(
-                str(runtime.raw("animate").get("location", "us-central1"))
-            ),
-            settings.vertex_video_output_gcs_uri,
-            model=video_config.model or "veo-3.1-fast-generate-001",
-            aspect_ratio=str(runtime.raw("animate").get("aspect_ratio", "16:9")),
-            resolution=str(runtime.raw("animate").get("resolution", "720p")),
-            clip_duration_seconds=int(runtime.raw("animate").get("duration_seconds", 8)),
-            poll_interval_seconds=video_config.poll_interval_seconds,
-            timeout_seconds=video_config.timeout_seconds,
-        )
-    elif video_config.provider == "gemini_omni":
-        project = _require_google_cloud_project(settings, "Gemini Omni video generation")
-        if not settings.vertex_video_output_gcs_uri:
-            raise ValueError(
-                "VERTEX_VIDEO_OUTPUT_GCS_URI is required for Gemini Omni image-to-video"
+    def build_video_generator(config: StepRuntimeConfig, step_id: str) -> VideoClipGenerator:
+        raw = runtime.raw(step_id)
+        if config.provider == "ffmpeg":
+            return FfmpegImageAnimator()
+        if config.provider == "replicate":
+            if not config.model:
+                raise ValueError(f"{step_id}.model is required for Replicate video generation")
+            return ReplicateVideoAssetGenerator(
+                replicate_client(config),
+                config.model,
+                str(raw.get("image_input_key", "image")),
+                config.model_input,
             )
-        video_clip_generator = GeminiOmniVideoAssetGenerator(
-            project,
-            settings.vertex_video_output_gcs_uri,
-            model=video_config.model or "gemini-omni-flash-preview",
-            aspect_ratio=str(runtime.raw("animate").get("aspect_ratio", "16:9")),
-            clip_duration_seconds=int(runtime.raw("animate").get("duration_seconds", 8)),
-            timeout_seconds=video_config.timeout_seconds,
-            store_output_in_gcs=bool(
-                runtime.raw("animate").get("store_output_in_gcs", False)
-            ),
-        )
-    else:
+        if config.provider == "vertex_ai":
+            assert vertex_client_factory is not None
+            model_input = config.model_input
+            return VertexVideoAssetGenerator(
+                vertex_client_factory.client(str(raw.get("location", "us-central1"))),
+                settings.vertex_video_output_gcs_uri,
+                model=config.model or "veo-3.1-fast-generate-001",
+                aspect_ratio=str(raw.get("aspect_ratio", model_input.get("aspect_ratio", "16:9"))),
+                resolution=str(raw.get("resolution", model_input.get("resolution", "720p"))),
+                clip_duration_seconds=int(
+                    raw.get("duration_seconds", model_input.get("duration", 8))
+                ),
+                poll_interval_seconds=config.poll_interval_seconds,
+                timeout_seconds=config.timeout_seconds,
+            )
+        if config.provider == "gemini_omni":
+            project = _require_google_cloud_project(settings, "Gemini Omni video generation")
+            if not settings.vertex_video_output_gcs_uri:
+                raise ValueError(
+                    "VERTEX_VIDEO_OUTPUT_GCS_URI is required for Gemini Omni image-to-video"
+                )
+            return GeminiOmniVideoAssetGenerator(
+                project,
+                settings.vertex_video_output_gcs_uri,
+                model=config.model or "gemini-omni-flash-preview",
+                aspect_ratio=str(raw.get("aspect_ratio", "16:9")),
+                clip_duration_seconds=int(raw.get("duration_seconds", 8)),
+                timeout_seconds=config.timeout_seconds,
+                store_output_in_gcs=bool(raw.get("store_output_in_gcs", False)),
+            )
         raise ValueError(
-            "animate.provider must be 'ffmpeg', 'replicate', 'vertex_ai', or 'gemini_omni'"
+            f"{step_id}.provider must be 'ffmpeg', 'replicate', 'vertex_ai', or 'gemini_omni'"
         )
+
+    video_clip_generator = build_video_generator(video_config, "animate")
 
     speech_synthesizer: SpeechSynthesizer
     speech_raw = runtime.raw("speech")
@@ -333,6 +364,10 @@ def build_pipeline(
         visual_planner=visual_planner,
         visual_asset_generator=visual_asset_generator,
         video_clip_generator=video_clip_generator,
+        whiteboard_video_clip_generator_factory=lambda: build_video_generator(
+            whiteboard_video_config,
+            "whiteboard_animate",
+        ),
         speech_synthesizer=speech_synthesizer,
         avatar_renderer=NoAvatarRenderer(),
         scene_renderer=FfmpegSceneRenderer(),
@@ -343,8 +378,23 @@ def build_pipeline(
         max_parallel_images=runtime.parallelism("generate_images"),
         max_parallel_speech=runtime.parallelism("speech"),
         max_parallel_animations=runtime.parallelism("animate"),
+        whiteboard_max_parallel_animations=runtime.parallelism("whiteboard_animate"),
         max_parallel_renders=runtime.parallelism("render"),
         maximum_shot_seconds=maximum_shot_seconds,
         duration_tolerance_percent=float(duration_config.get("tolerance_percent", 5)),
         words_per_minute=int(duration_config.get("words_per_minute", 155)),
+        storyboard_enabled=bool(storyboard_config.get("enabled", True)),
+        storyboard_panel_seconds=float(storyboard_config.get("panel_seconds", 3)),
+        storyboard_panels_per_sheet=int(storyboard_config.get("panels_per_sheet", 9)),
+        whiteboard_target_take_seconds=float(
+            whiteboard_states_config.get("target_take_seconds", 2)
+        ),
+        dialogue_voices=tuple(
+            str(voice)
+            for voice in speech_raw.get(
+                "dialogue_voices",
+                ["Kore", "Puck", "Aoede", "Charon", "Fenrir", "Leda", "Orus", "Zephyr"],
+            )
+        ),
+        critical_information_signals=critical_information_signals,
     )

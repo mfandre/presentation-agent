@@ -138,6 +138,89 @@ def test_system_demo_is_redesigned_as_static_training_artwork() -> None:
     validate_corporate_training_plan(directed)
 
 
+def test_phone_camera_screen_is_a_process_not_a_system_demo() -> None:
+    script = _script(
+        "No fluxo prático, registre a solicitação, envie o comprovante para aprovação do gestor "
+        "e aguarde o pagamento do financeiro."
+    )
+    plan = PresentationVisualPlan(
+        scenes=[
+            VisualScenePlan(
+                scene_number=1,
+                source_slide_numbers=[1],
+                media_mode=MediaMode.STATIC,
+                prompt=(
+                    "Close-up de um colaborador digitalizando um comprovante; a smartphone "
+                    "screen mostra apenas o enquadramento da câmera."
+                ),
+                scene_purpose="Ensinar o fluxo de reembolso",
+            )
+        ]
+    )
+
+    scene = direct_corporate_training_plan(plan, script).scenes[0]
+
+    assert scene.instructional_type == InstructionalContentType.PROCESS
+    assert scene.media_mode == MediaMode.VIDEO
+
+
+def test_ui_noun_without_real_interface_or_click_instruction_is_not_system_demo() -> None:
+    script = _script("O botão de emergência é obrigatório em toda área operacional.")
+    plan = PresentationVisualPlan(
+        scenes=[
+            VisualScenePlan(
+                scene_number=1,
+                source_slide_numbers=[1],
+                media_mode=MediaMode.STATIC,
+                prompt="Botão físico de emergência ao lado de uma máquina industrial.",
+                scene_purpose="Explicar uma regra de segurança",
+            )
+        ]
+    )
+
+    scene = direct_corporate_training_plan(plan, script).scenes[0]
+
+    assert scene.instructional_type == InstructionalContentType.RULE
+    assert scene.instructional_type != InstructionalContentType.SYSTEM_DEMO
+
+
+def test_long_training_cannot_end_without_dynamic_process_or_behavior() -> None:
+    script = PresentationScript(
+        title="Treinamento longo",
+        scenes=[
+            SceneScript(
+                scene_number=number,
+                source_slide_numbers=[number],
+                narration="Esta regra obrigatória define o limite permitido pela política.",
+                target_seconds=20,
+            )
+            for number in (1, 2)
+        ],
+        total_estimated_seconds=40,
+    )
+    plan = PresentationVisualPlan(
+        scenes=[
+            VisualScenePlan(
+                scene_number=number,
+                source_slide_numbers=[number],
+                media_mode=MediaMode.STATIC,
+                prompt=f"Regra {number} com limite e prazo obrigatório.",
+                scene_purpose=f"Ensinar a regra {number}",
+            )
+            for number in (1, 2)
+        ]
+    )
+
+    scenes = direct_corporate_training_plan(plan, script).scenes
+
+    assert any(
+        scene.media_mode == MediaMode.VIDEO
+        and scene.instructional_type
+        in {InstructionalContentType.PROCESS, InstructionalContentType.BEHAVIOR}
+        for scene in scenes
+    )
+
+
 def test_consecutive_rules_alternate_still_and_animated_treatments() -> None:
     script = _script(
         "O prazo obrigatório é de trinta dias.",

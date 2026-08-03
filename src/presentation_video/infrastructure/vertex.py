@@ -16,15 +16,21 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
+from presentation_video.domain.errors import (
+    ThirdPartyContentBlockedError,
+    VisualSafetyBlockedError,
+)
 from presentation_video.domain.models import (
     AudioArtifact,
     MediaMode,
     SlideContent,
+    VideoGeneratorCapabilities,
     VisualArtifact,
     VisualScenePlan,
 )
 from presentation_video.infrastructure.speech import _delivery_prompt
 from presentation_video.infrastructure.visual_media import (
+    FfmpegImageAnimator,
     _artifact_stem,
     _visible_language_guard,
     _visual_prompt,
@@ -125,8 +131,7 @@ class VertexImageAssetGenerator:
             raise ValueError("Preserved static scenes must use an unchanged source page")
 
         has_identity_reference = any(
-            slide.title.startswith("Character identity reference")
-            for slide in source_slides
+            slide.title.startswith("Character identity reference") for slide in source_slides
         )
         identity_instruction = (
             " The attachment titled Character identity reference is a cast reference only. Copy "
@@ -227,6 +232,60 @@ class VertexImageAssetGenerator:
         )
 
 
+def _veo_duration_for_take(requested_seconds: float, maximum_seconds: int = 8) -> int:
+    supported = tuple(seconds for seconds in (4, 6, 8) if seconds <= maximum_seconds)
+    if not supported:
+        raise ValueError("Veo maximum duration must allow at least a 4-second clip")
+    requested = max(requested_seconds, supported[0])
+    return next((seconds for seconds in supported if seconds >= requested), supported[-1])
+
+
+def _veo_animation_prompt(
+    plan: VisualScenePlan,
+    *,
+    original_content_only: bool = False,
+) -> str:
+    originality = (
+        "This is an independent production using only the original fictional designs visible in "
+        "the supplied frame. Do not imitate, reference, or introduce any existing franchise, "
+        "film studio, copyrighted character, trademarked style, celebrity, or recognizable "
+        "third-party design. "
+        if original_content_only
+        else ""
+    )
+    if "whiteboard animation" in plan.visual_style.lower():
+        return (
+            f"{originality}Mechanical tracing task, not a creative drawing task. Locked overhead "
+            f"camera. {_visible_language_guard(plan)}"
+            "Pure white board. Show exactly one natural human hand holding exactly one plain "
+            "black felt-tip marker. The first supplied image is the exact first frame. The "
+            "last supplied image is the exact final frame and the complete tracing template. "
+            "Move the hand at a calm, readable speed. Keep the marker tip touching the board "
+            "and reveal only the missing black strokes from the final template. Trace those "
+            "strokes exactly at their final coordinates, with their final shape and thickness. "
+            "Do not interpret the subject. Do not improvise, embellish, complete, replace, "
+            "simplify, decorate, preview, or invent any line or object. Do not draw from the "
+            "narration. Preserve every line already visible in the first frame without "
+            "redrawing, erasing, moving, or changing it. Pixels that are white in the final "
+            "frame must remain white for the whole video. After completing the permitted "
+            "strokes, hold briefly on the exact final frame. No camera motion, zoom, pan, "
+            "cuts, transitions, color, text, handwriting, or animation of existing objects."
+        )
+    return (
+        f"{originality}Animate the supplied approved image into a short, coherent cinematic "
+        f"shot. {_visible_language_guard(plan)}"
+        "Preserve the identity, appearance, position, proportions, and relationships of all "
+        "subjects and objects. Use subtle natural subject motion and restrained camera motion "
+        f"at normal speed. Camera direction: {plan.camera_motion.strip()}. "
+        f"Entrance: {plan.entrance_motion}. Focal action: {plan.focal_action}. "
+        f"End by {plan.transition_out}. Apply that direction "
+        "only as camera or subject motion; do not turn it into a new object or concept. "
+        "Do not morph objects, invent interfaces, or add new visual concepts. "
+        "The clip must contain absolutely no words, letters, numbers, captions, subtitles, "
+        "logos, signs, documents, screens, user interfaces, charts, tables, or watermarks."
+    )
+
+
 class VertexVideoAssetGenerator:
     """Animates an approved image and stores the returned Veo clip locally."""
 
@@ -265,6 +324,15 @@ class VertexVideoAssetGenerator:
         self._retry_backoff_seconds = retry_backoff_seconds
         self._request_id_factory = request_id_factory or (lambda: uuid.uuid4().hex[:12])
 
+    @property
+    def capabilities(self) -> VideoGeneratorCapabilities:
+        return VideoGeneratorCapabilities(
+            minimum_output_seconds=4,
+            maximum_output_seconds=float(self._clip_duration_seconds),
+            supports_first_frame=True,
+            supports_last_frame=True,
+        )
+
     async def animate(
         self,
         plan: VisualScenePlan,
@@ -293,51 +361,28 @@ class VertexVideoAssetGenerator:
             if image.start_path is not None
             else None
         )
-        if "whiteboard animation" in plan.visual_style.lower():
-            prompt = (
-                "Mechanical tracing task, not a creative drawing task. Locked overhead camera. "
-                f"{_visible_language_guard(plan)}"
-                "Pure white board. Show exactly one natural human hand holding exactly one plain "
-                "black felt-tip marker. The first supplied image is the exact first frame. The "
-                "last supplied image is the exact final frame and the complete tracing template. "
-                "Move the hand at a calm, readable speed. Keep the marker tip touching the board "
-                "and reveal only the missing black strokes from the final template. Trace those "
-                "strokes exactly at their final coordinates, with their final shape and thickness. "
-                "Do not interpret the subject. Do not improvise, embellish, complete, replace, "
-                "simplify, decorate, preview, or invent any line or object. Do not draw from the "
-                "narration. Preserve every line already visible in the first frame without "
-                "redrawing, erasing, moving, or changing it. Pixels that are white in the final "
-                "frame must remain white for the whole video. After completing the permitted "
-                "strokes, hold briefly on the exact final frame. No camera motion, zoom, pan, "
-                "cuts, transitions, color, text, handwriting, or animation of existing objects."
-            )
-        else:
-            prompt = (
-                "Animate the supplied approved image into a short, coherent documentary shot. "
-                f"{_visible_language_guard(plan)}"
-                "Preserve the identity, appearance, position, proportions, and relationships of all "
-                "subjects and objects. Use subtle natural subject motion and restrained camera motion "
-                f"at normal speed. Camera direction: {plan.camera_motion.strip()}. "
-                f"Entrance: {plan.entrance_motion}. Focal action: {plan.focal_action}. "
-                f"End by {plan.transition_out}. Apply that direction "
-                "only as camera or subject motion; do not turn it into a new object or concept. "
-                "Do not morph objects, invent interfaces, or add new visual concepts. "
-                "The clip must contain absolutely no words, letters, numbers, captions, subtitles, "
-                "logos, signs, documents, screens, user interfaces, charts, tables, or watermarks."
-            )
-        scene_output_uri = None
-        if self._output_gcs_uri:
+        prompt = _veo_animation_prompt(plan)
+
+        def next_scene_output_uri() -> str | None:
+            if not self._output_gcs_uri:
+                return None
             request_id = self._request_id_factory().strip()
             if not request_id or "/" in request_id:
                 raise ValueError("Vertex video request ID must be a non-empty GCS path segment")
-            scene_output_uri = (
+            return (
                 f"{self._output_gcs_uri}/{_artifact_stem(image.scene_number, image.shot_number)}"
                 f"-r{image.revision}-{request_id}"
             )
+
+        scene_output_uri = next_scene_output_uri()
+        requested_clip_seconds = _veo_duration_for_take(
+            duration_seconds,
+            maximum_seconds=self._clip_duration_seconds,
+        )
         config = types.GenerateVideosConfig(
             number_of_videos=1,
             output_gcs_uri=scene_output_uri,
-            duration_seconds=self._clip_duration_seconds,
+            duration_seconds=requested_clip_seconds,
             aspect_ratio=self._aspect_ratio,
             resolution=self._resolution,
             last_frame=last_frame,
@@ -359,36 +404,81 @@ class VertexVideoAssetGenerator:
             image.scene_number,
             image.revision,
             self._model,
-            self._clip_duration_seconds,
+            requested_clip_seconds,
             duration_seconds,
             self._aspect_ratio,
             self._resolution,
             "gcs" if scene_output_uri else "inline",
             scene_output_uri,
         )
-        operation = await _run_with_retries(
-            operation_name=f"vertex video submission scene={image.scene_number}",
-            operation=lambda: self._client.models.generate_videos(
-                model=self._model,
-                prompt=prompt,
-                image=source_image,
-                config=config,
-            ),
-            max_retries=self._max_retries,
-            timeout_seconds=self._timeout_seconds,
-            retry_backoff_seconds=self._retry_backoff_seconds,
-        )
+
+        async def submit_and_poll(
+            candidate_prompt: str,
+            candidate_config: types.GenerateVideosConfig,
+            attempt_started_at: float,
+        ) -> Any:
+            try:
+                submitted = await _run_with_retries(
+                    operation_name=f"vertex video submission scene={image.scene_number}",
+                    operation=lambda: self._client.models.generate_videos(
+                        model=self._model,
+                        prompt=candidate_prompt,
+                        image=source_image,
+                        config=candidate_config,
+                    ),
+                    max_retries=self._max_retries,
+                    timeout_seconds=self._timeout_seconds,
+                    retry_backoff_seconds=self._retry_backoff_seconds,
+                )
+            except Exception as exc:
+                if _is_third_party_content_block(exc):
+                    raise ThirdPartyContentBlockedError("Veo", exc) from exc
+                raise
+            logger.info(
+                "vertex video generation submitted scene=%s operation=%s",
+                image.scene_number,
+                getattr(submitted, "name", None) or "unknown",
+            )
+            return await self._poll_operation(
+                submitted,
+                scene_number=image.scene_number,
+                started_at=attempt_started_at,
+            )
+
+        try:
+            operation = await submit_and_poll(prompt, config, started_at)
+        except ThirdPartyContentBlockedError:
+            logger.warning(
+                "vertex video blocked by possible third-party content; retrying with explicit "
+                "original-design prompt scene=%s shot=%s model=%s",
+                image.scene_number,
+                image.shot_number,
+                self._model,
+            )
+            retry_started_at = time.monotonic()
+            retry_config = config.model_copy(update={"output_gcs_uri": next_scene_output_uri()})
+            try:
+                operation = await submit_and_poll(
+                    _veo_animation_prompt(plan, original_content_only=True),
+                    retry_config,
+                    retry_started_at,
+                )
+                started_at = retry_started_at
+            except ThirdPartyContentBlockedError:
+                logger.warning(
+                    "vertex video original-design retry also blocked; using local motion fallback "
+                    "scene=%s shot=%s model=%s",
+                    image.scene_number,
+                    image.shot_number,
+                    self._model,
+                )
+                return await FfmpegImageAnimator().animate(
+                    plan,
+                    image.model_copy(update={"start_path": None}),
+                    output_dir,
+                    duration_seconds,
+                )
         operation_name = getattr(operation, "name", None) or "unknown"
-        logger.info(
-            "vertex video generation submitted scene=%s operation=%s",
-            image.scene_number,
-            operation_name,
-        )
-        operation = await self._poll_operation(
-            operation,
-            scene_number=image.scene_number,
-            started_at=started_at,
-        )
         video = _extract_generated_video(operation)
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -474,6 +564,8 @@ class VertexVideoAssetGenerator:
 
         error = getattr(operation, "error", None)
         if error:
+            if _is_third_party_content_block(error):
+                raise ThirdPartyContentBlockedError("Veo", error)
             raise RuntimeError(
                 f"Veo operation {getattr(operation, 'name', None) or 'unknown'} failed: {error}"
             )
@@ -537,6 +629,7 @@ class VertexSpeechSynthesizer:
         output_path: Path,
         language: str | None = None,
         style: str | None = None,
+        voice: str | None = None,
     ) -> AudioArtifact:
         spoken_language = language or self._language_code
         instruction = (
@@ -550,7 +643,9 @@ class VertexSpeechSynthesizer:
             speech_config=types.SpeechConfig(
                 language_code=spoken_language,
                 voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self._voice)
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=voice or self._voice
+                    )
                 ),
             ),
         )
@@ -559,7 +654,7 @@ class VertexSpeechSynthesizer:
             "vertex TTS generation started model=%s voice=%s language=%s "
             "text_characters=%s path=%s",
             self._model,
-            self._voice,
+            voice or self._voice,
             spoken_language,
             len(text),
             output_path,
@@ -662,6 +757,10 @@ def _extract_inline_media(response: Any, media_prefix: str) -> tuple[bytes, str]
         str(getattr(candidate, "finish_reason", None))
         for candidate in getattr(response, "candidates", None) or []
     ]
+    if media_prefix == "image/" and any(
+        "IMAGE_PROHIBITED_CONTENT" in reason.upper() for reason in finish_reasons
+    ):
+        raise VisualSafetyBlockedError("Vertex", finish_reasons)
     raise RuntimeError(
         f"Vertex model returned no {media_prefix.rstrip('/')} bytes"
         + (f"; finish_reasons={finish_reasons}" if finish_reasons else "")
@@ -685,6 +784,11 @@ def _extract_generated_video(operation: Any) -> Any:
             "returned an empty video result"
         )
     return video
+
+
+def _is_third_party_content_block(error: object) -> bool:
+    message = str(error).casefold()
+    return "third-party content providers" in message or "35561575" in message
 
 
 def _as_bytes(value: Any) -> bytes:

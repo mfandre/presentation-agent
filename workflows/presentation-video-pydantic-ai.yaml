@@ -1,5 +1,5 @@
 id: presentation-video-pydantic-ai
-version: 2.5.0
+version: 2.9.0
 description: Pydantic AI para roteiro e direção visual, com mídia no Google Vertex AI.
 
 inputs:
@@ -30,12 +30,23 @@ settings:
 steps:
   - id: ingest
     uses: document.ingest
+    description: Lê o documento e extrai páginas, textos, notas e imagens para as próximas etapas.
     outputs:
       document: presentation_document
 
+  - id: content_audit
+    uses: content.audit
+    description: Identifica regras, prazos, números, tabelas e informações críticas que não podem ser omitidas.
+    needs: [ingest]
+    config:
+      signals: [approval_matrix, deadlines, exact_numbers, tables]
+      mandatory_priority: 4
+      exact_information_requires_static_anchor: true
+
   - id: narrative
     uses: narrative.plan
-    needs: [ingest]
+    description: Transforma o documento em uma história coerente e escreve o texto falado de cada cena.
+    needs: [ingest, content_audit]
     config:
       provider: pydantic_ai
       model: google-cloud:gemini-3.5-flash
@@ -48,9 +59,18 @@ steps:
       attempts: 3
       backoff_seconds: 1
 
+  - id: content_coverage
+    uses: content.coverage.validate
+    description: Confere se todas as informações obrigatórias permanecem representadas no roteiro.
+    needs: [narrative, content_audit]
+    config:
+      require_all_mandatory_information: true
+      reject_page_only_coverage: true
+
   - id: duration_validate
     uses: narrative.duration_validate
-    needs: [narrative]
+    description: Verifica se o roteiro cabe na duração solicitada e calcula o tempo estimado.
+    needs: [content_coverage]
     config:
       words_per_minute: 155
       tolerance_percent: 5
@@ -58,17 +78,21 @@ steps:
 
   - id: duration_review
     uses: human.duration_approval
+    description: Solicita a decisão do usuário quando é necessário resumir ou aceitar uma duração maior.
     needs: [duration_validate]
     checkpoint: human
 
   - id: speech
     uses: speech.synthesize
+    description: Gera a narração ou os diálogos e mede o áudio real para alinhar as cenas.
     needs: [duration_review]
     config:
       provider: vertex_ai
       model: gemini-3.1-flash-tts-preview
       location: global
       voice: Kore
+      # Vozes atribuídas de forma determinística aos personagens no modo diálogo cinematográfico.
+      dialogue_voices: [Kore, Puck, Aoede, Charon, Fenrir, Leda, Orus, Zephyr]
       language_code: pt-BR
       style_prompt: Narração profissional, natural, clara e envolvente.
       max_retries: 2
@@ -83,6 +107,7 @@ steps:
 
   - id: scene_plan
     uses: scenes.plan
+    description: Divide o roteiro em cenas e takes e identifica conteúdos informativos que devem permanecer estáticos.
     needs: [narrative, speech]
     config:
       maximum_shot_seconds: 8
@@ -90,9 +115,17 @@ steps:
       informational_scenes:
         preserve_as_static: true
         maximum_takes: 1
+        signals:
+          - readable_text
+          - tables
+          - exact_numbers
+          - deadlines
+          - process_flow
+          - approval_matrix
 
   - id: visual_plan
     uses: visuals.direct
+    description: Define composição, personagens, continuidade, identidade visual e movimentos de câmera.
     needs: [scene_plan]
     when:
       input: production_mode
@@ -107,6 +140,7 @@ steps:
 
   - id: instructional_design
     uses: training.classify_and_direct
+    description: Classifica cada cena de treinamento e escolhe o tratamento instrucional adequado.
     needs: [visual_plan]
     when:
       input: production_mode
@@ -122,6 +156,7 @@ steps:
 
   - id: whiteboard_concept_plan
     uses: whiteboard.concepts.plan
+    description: Organiza a explicação whiteboard em ideias didáticas cumulativas e em ordem clara de desenho.
     needs: [scene_plan]
     when:
       input: production_mode
@@ -134,6 +169,7 @@ steps:
 
   - id: prompt_compile
     uses: prompts.compile
+    description: Converte roteiro e direção visual em prompts completos por take, preservando continuidade.
     needs: [visual_plan, instructional_design, whiteboard_concept_plan]
     config:
       continuity: causal_state_locked
@@ -144,6 +180,7 @@ steps:
 
   - id: rule_validate
     uses: rules.validate
+    description: Valida duração, cobertura, restrições do formato e consistência antes da geração de mídia.
     needs: [prompt_compile]
     config:
       maximum_shot_seconds: 8
@@ -151,10 +188,11 @@ steps:
 
   - id: generate_images
     uses: assets.generate
+    description: Cria as imagens aprováveis de cada cena ou take usando o planejamento visual.
     needs: [rule_validate]
     when:
       input: production_mode
-      not_equals: whiteboard_explainer
+      not_in: [whiteboard_explainer, cinematic_story]
     parallelism: 3
     config:
       provider: vertex_ai
@@ -167,8 +205,41 @@ steps:
       attempts: 4
       backoff_seconds: 2
 
+  - id: character_references
+    uses: characters.reference_sheets.generate
+    description: Cria referências dos personagens para preservar rosto, roupa e identidade no storyboard.
+    needs: [rule_validate]
+    when:
+      input: production_mode
+      equals: cinematic_story
+    config:
+      provider_config_from: generate_images
+      one_sheet_per_character: true
+      immutable_identity: [face, age, proportions, hair, wardrobe, colors, accessories]
+      background: neutral_grey
+      visible_labels: false
+
+  - id: storyboard
+    uses: storyboard.generate_and_split
+    description: Gera o storyboard cinematográfico mestre e prepara seus painéis para revisão ou animação.
+    needs: [character_references]
+    when:
+      input: production_mode
+      equals: cinematic_story
+    config:
+      provider_config_from: generate_images
+      enabled: true
+      panel_seconds: 3
+      panels_per_sheet: 9
+      overall_aspect_ratio: "16:9"
+      cell_aspect_ratio: "16:9"
+      clean_machine_copy: true
+      annotated_review_copy: true
+      fallback: split_into_panels
+
   - id: whiteboard_master
     uses: whiteboard.master.generate
+    description: Gera a ilustração final completa que servirá como referência imutável do whiteboard.
     needs: [rule_validate]
     when:
       input: production_mode
@@ -189,6 +260,7 @@ steps:
 
   - id: whiteboard_states
     uses: whiteboard.states.build
+    description: Cria estados intermediários determinísticos, do quadro vazio até o desenho completo.
     needs: [whiteboard_master]
     when:
       input: production_mode
@@ -198,18 +270,22 @@ steps:
       cumulative: true
       initial_state: blank
       reveal_order: left_to_right
+      target_take_seconds: 2
+      clamp_to_model_minimum_duration: true
 
   - id: visual_review
     uses: human.approval
-    needs: [generate_images, whiteboard_states]
+    description: Pausa o fluxo para aprovar, editar, regenerar ou substituir os visuais antes da animação.
+    needs: [generate_images, storyboard, whiteboard_states]
     checkpoint: human
 
   - id: animate
     uses: videos.generate
+    description: Anima individualmente as imagens aprovadas nos formatos com takes convencionais.
     needs: [visual_review]
     when:
       input: production_mode
-      not_equals: whiteboard_explainer
+      not_in: [whiteboard_explainer, cinematic_story]
     parallelism: 2
     config:
       provider: vertex_ai
@@ -224,8 +300,25 @@ steps:
       attempts: 3
       backoff_seconds: 2
 
+  - id: storyboard_animate
+    uses: videos.storyboard.route_and_generate
+    description: Envia o storyboard inteiro a modelos multi-shot ou anima seus painéis separadamente.
+    needs: [visual_review]
+    when:
+      input: production_mode
+      equals: cinematic_story
+    parallelism: 1
+    config:
+      provider_config_from: animate
+      capability_scope: model
+      direct_when: [supports_storyboard_reference, supports_multishot]
+      video_inputs: storyboard_only
+      segment_by: [model_maximum_seconds, scene_boundary]
+      fallback: animate_split_panels_with_first_last_when_supported
+
   - id: whiteboard_animate
     uses: whiteboard.transitions.generate
+    description: Anima a transição entre estados progressivos preservando tudo que já estava desenhado.
     needs: [visual_review]
     when:
       input: production_mode
@@ -240,7 +333,7 @@ steps:
       natural_drawing_speed: true
       model_input:
         aspect_ratio: "16:9"
-        duration: 8
+        duration: 4
         resolution: 720p
       poll_interval_seconds: 5
       timeout_seconds: 900
@@ -250,7 +343,8 @@ steps:
 
   - id: visual_qa
     uses: visuals.qa
-    needs: [animate, whiteboard_animate]
+    description: Verifica existência, duração e integridade dos vídeos antes da composição.
+    needs: [animate, storyboard_animate, whiteboard_animate]
     config:
       verify_duration: true
       verify_non_empty_media: true
@@ -258,15 +352,18 @@ steps:
 
   - id: render
     uses: video.compose_scenes
+    description: Combina o visual de cada cena com áudio, duração, enquadramento e identidade visual.
     needs: [speech, visual_qa]
     parallelism: 2
 
   - id: assemble
     uses: video.compose_final
+    description: Concatena as cenas e acrescenta abertura, encerramento e watermark configurados.
     needs: [render]
 
   - id: captions
     uses: captions.package
+    description: Gera os arquivos de legenda VTT e SRT sincronizados com o vídeo final.
     needs: [assemble]
     config:
       formats: [webvtt, srt]

@@ -32,3 +32,22 @@ class NarrativeGenerationError(UserFacingError):
 
 class MissingMediaDependencyError(UserFacingError):
     """Raised when a required local audio/video executable is unavailable."""
+
+
+class VisualSafetyBlockedError(RuntimeError):
+    """Raised when an image provider returns no media because of its safety filter."""
+
+    def __init__(self, provider: str, finish_reasons: list[str]) -> None:
+        self.provider = provider
+        self.finish_reasons = finish_reasons
+        suffix = f"; finish_reasons={finish_reasons}" if finish_reasons else ""
+        super().__init__(f"{provider} model blocked image generation{suffix}")
+
+
+class ThirdPartyContentBlockedError(RuntimeError):
+    """Raised when a media provider rejects a request as resembling third-party content."""
+
+    def __init__(self, provider: str, details: object) -> None:
+        self.provider = provider
+        self.details = details
+        super().__init__(f"{provider} blocked possible third-party content: {details}")

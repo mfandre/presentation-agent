@@ -105,15 +105,41 @@ async def test_omni_can_still_store_output_in_gcs(tmp_path: Path) -> None:
     assert result.path.read_bytes() == b"gcs-video"
 
 
+@pytest.mark.asyncio
+async def test_omni_accepts_only_storyboard_for_multishot(
+    tmp_path: Path,
+) -> None:
+    session = FakeSession(
+        {"data": base64.b64encode(b"multi-shot-video").decode(), "mime_type": "video/mp4"}
+    )
+    storyboard = _image(tmp_path)
+    result = await _generator(session, store_output=False, duration=8).animate_storyboard(
+        [_plan(), _plan().model_copy(update={"shot_number": 2})],
+        storyboard,
+        tmp_path / "output",
+        duration_seconds=6,
+        segment_number=1,
+    )
+
+    inputs = session.body["input"]
+    assert isinstance(inputs, list)
+    assert [item["type"] for item in inputs] == ["text", "image"]
+    assert "continuous cinematic multi-shot sequence" in inputs[0]["text"]
+    assert "character sheets" not in inputs[0]["text"]
+    assert "No audio" in inputs[0]["text"]
+    assert result.path.read_bytes() == b"multi-shot-video"
+
+
 def _generator(
     session: FakeSession,
     *,
     store_output: bool,
+    duration: int = 3,
 ) -> GeminiOmniVideoAssetGenerator:
     return GeminiOmniVideoAssetGenerator(
         project="project",
         output_gcs_uri="gs://bucket/staging",
-        clip_duration_seconds=3,
+        clip_duration_seconds=duration,
         store_output_in_gcs=store_output,
         storage_client=FakeStorage(),
         session=session,

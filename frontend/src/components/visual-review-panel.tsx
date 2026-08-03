@@ -134,7 +134,7 @@ export function VisualReviewPanel({
           </h2>
           <p>
             {job.production_mode === "cinematic_story"
-              ? "Cada cartão é um take de até 8 segundos, sincronizado a um trecho específico da narração."
+              ? "Cada cartão é um recorte do storyboard mestre, sincronizado à narração. Modelos multi-shot recebem blocos do storyboard; os demais animam estes recortes."
               : job.production_mode === "whiteboard_explainer"
                 ? "Cada cartão mostra um quadro didático que será construído progressivamente durante a narração."
                 : job.production_mode === "corporate_training"
@@ -198,6 +198,43 @@ export function VisualReviewPanel({
 
       {error && <div className="visual-review__error" role="alert">{error}</div>}
 
+      {job.production_mode === "cinematic_story" && (
+        (job.character_references ?? []).length > 0 || (job.storyboard_sheets ?? []).length > 0
+      ) && <section className="storyboard-assets" aria-label="Artefatos mestres do storyboard">
+        {(job.character_references ?? []).length > 0 && <div>
+          <h3>Elenco canônico</h3>
+          <p>Estas folhas fixam a identidade dos personagens antes da criação do storyboard.</p>
+          <div className="storyboard-assets__grid storyboard-assets__grid--characters">
+            {(job.character_references ?? []).map((reference) => (
+              <figure key={reference.character_id}>
+                <img
+                  src={assetUrl(reference.image_url)}
+                  alt={`Folha de referência do personagem ${reference.character_id}`}
+                />
+                <figcaption>{reference.character_id.replaceAll("_", " ")}</figcaption>
+              </figure>
+            ))}
+          </div>
+        </div>}
+        {(job.storyboard_sheets ?? []).length > 0 && <div>
+          <h3>Storyboard mestre</h3>
+          <p>A versão anotada é apenas para revisão; a cópia limpa é usada na geração de vídeo.</p>
+          <div className="storyboard-assets__grid">
+            {(job.storyboard_sheets ?? []).map((sheet) => (
+              <figure key={sheet.sheet_number}>
+                <img
+                  src={assetUrl(sheet.image_url)}
+                  alt={`Storyboard mestre ${sheet.sheet_number}`}
+                />
+                <figcaption>
+                  Folha {sheet.sheet_number} · painéis {sheet.panel_numbers.join(", ")}
+                </figcaption>
+              </figure>
+            ))}
+          </div>
+        </div>}
+      </section>}
+
       <div className="visual-grid">
         {job.scene_images.map((scene) => {
           const shotKey = `${scene.scene_number}-${scene.shot_number}`;
@@ -208,7 +245,7 @@ export function VisualReviewPanel({
             && !scene.preserve_source_frame
           );
           const canPromptRegenerate = isVideo || !scene.preserve_source_frame;
-          const isEditable = true;
+          const isEditable = !scene.locked_static;
           const regenerating = job.regenerating_scene_numbers.includes(scene.scene_number);
           const editedPrompt = editedPrompts[shotKey] ?? scene.prompt;
           const editorOpen = Boolean(openEditors[shotKey]);
@@ -229,6 +266,8 @@ export function VisualReviewPanel({
                   {isVideo ? <Clapperboard size={13} /> : <FileText size={13} />}
                   {isVideo
                     ? "Vídeo sem texto"
+                    : scene.locked_static && scene.critical_information_titles.length > 0
+                      ? "Informação exata"
                     : isInstructionalStill
                       ? "Ilustração instrucional"
                       : scene.preserve_source_frame ? "Captura fiel" : "Ilustração editorial"}
@@ -253,7 +292,9 @@ export function VisualReviewPanel({
                   <PencilLine size={15} />
                   {editorOpen ? "Fechar editor" : "Editar prompt e regenerar"}
                 </button> : <div className="visual-card__static-note">
-                  Conteúdo preservado da página {scene.source_slide_number ?? scene.source_slide_numbers[0]}
+                  {scene.critical_information_titles.length > 0
+                    ? scene.critical_information_titles.join(" · ")
+                    : `Conteúdo preservado da página ${scene.source_slide_number ?? scene.source_slide_numbers[0]}`}
                 </div>}
               </div>
               {isEditable && editorOpen && <div className="visual-card__body" id={editorId}>

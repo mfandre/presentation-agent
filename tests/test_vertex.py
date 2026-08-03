@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from google.genai.errors import ClientError
 
+from presentation_video.domain.errors import VisualSafetyBlockedError
 from presentation_video.domain.models import (
     MediaMode,
     SlideContent,
@@ -18,6 +19,7 @@ from presentation_video.infrastructure.vertex import (
     VertexImageAssetGenerator,
     VertexSpeechSynthesizer,
     VertexVideoAssetGenerator,
+    _veo_duration_for_take,
 )
 
 
@@ -27,6 +29,12 @@ class FakeAsyncClient:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+def test_veo_uses_the_shortest_supported_duration_for_a_take() -> None:
+    assert _veo_duration_for_take(2) == 4
+    assert _veo_duration_for_take(4.1) == 6
+    assert _veo_duration_for_take(7.5) == 8
 
 
 def test_client_factory_creates_explicit_vertex_client_per_location() -> None:
@@ -222,6 +230,28 @@ async def test_image_generator_does_not_retry_permanent_vertex_4xx(tmp_path: Pat
     assert models.calls == 1
 
 
+@pytest.mark.asyncio
+async def test_image_generator_exposes_vertex_prohibited_content_as_typed_error(
+    tmp_path: Path,
+) -> None:
+    blocked = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                content=SimpleNamespace(parts=[]),
+                finish_reason="FinishReason.IMAGE_PROHIBITED_CONTENT",
+            )
+        ]
+    )
+    generator = VertexImageAssetGenerator(
+        SimpleNamespace(models=FakeContentModels(blocked)),
+        max_retries=0,
+        retry_backoff_seconds=0,
+    )
+
+    with pytest.raises(VisualSafetyBlockedError, match="IMAGE_PROHIBITED_CONTENT"):
+        await generator.generate(_video_plan(), [], tmp_path)
+
+
 class FakeVideoModels:
     def __init__(self, operation: object) -> None:
         self.operation = operation
@@ -353,6 +383,72 @@ async def test_video_generator_polls_veo_and_downloads_gcs_result(
     assert config.output_gcs_uri == "gs://video-results/jobs/scene-003-r2-test-request"
     assert storage.bucket_names == ["video-results"]
     assert bucket.object_names == ["jobs/scene-003/output-0.mp4"]
+
+
+@pytest.mark.asyncio
+async def test_video_generator_retries_third_party_block_with_original_design_prompt(
+    tmp_path: Path,
+) -> None:
+    blocked = SimpleNamespace(
+        name="projects/p/locations/us-central1/operations/blocked",
+        done=True,
+        metadata=None,
+        error={
+            "code": 3,
+            "message": (
+                "The prompt could not be submitted due to the interests of third-party content "
+                "providers. Support codes: 35561575"
+            ),
+        },
+        result=None,
+        response=None,
+    )
+    completed = SimpleNamespace(
+        name="projects/p/locations/us-central1/operations/original",
+        done=True,
+        metadata=None,
+        error=None,
+        result=SimpleNamespace(
+            generated_videos=[
+                SimpleNamespace(
+                    video=SimpleNamespace(uri=None, video_bytes=b"original-design-video")
+                )
+            ],
+            rai_media_filtered_reasons=None,
+        ),
+        response=None,
+    )
+
+    class SequencedVideoModels:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def generate_videos(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return blocked if len(self.calls) == 1 else completed
+
+    models = SequencedVideoModels()
+    source_image = tmp_path / "approved.png"
+    source_image.write_bytes(b"\x89PNG\r\napproved-image")
+    generator = VertexVideoAssetGenerator(
+        SimpleNamespace(models=models),
+        output_gcs_uri=None,
+        max_retries=0,
+        poll_interval_seconds=0,
+    )
+
+    artifact = await generator.animate(
+        _video_plan(),
+        VisualArtifact(scene_number=3, path=source_image, kind="image"),
+        tmp_path / "clips",
+        duration_seconds=6,
+    )
+
+    assert artifact.path.read_bytes() == b"original-design-video"
+    assert len(models.calls) == 2
+    assert "recognizable third-party design" not in str(models.calls[0]["prompt"])
+    assert "recognizable third-party design" in str(models.calls[1]["prompt"])
+    assert all(call["config"].generate_audio is False for call in models.calls)
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from presentation_video.domain.models import MediaMode, VisualArtifact, VisualScenePlan
+from presentation_video.domain.models import (
+    MediaMode,
+    VideoGeneratorCapabilities,
+    VisualArtifact,
+    VisualScenePlan,
+)
 from presentation_video.infrastructure.visual_media import _visible_language_guard
 
 logger = logging.getLogger(__name__)
@@ -66,6 +71,18 @@ class GeminiOmniVideoAssetGenerator:
         self._store_output_in_gcs = store_output_in_gcs
         self._storage_client = storage_client
         self._session = session
+
+    @property
+    def capabilities(self) -> VideoGeneratorCapabilities:
+        return VideoGeneratorCapabilities(
+            supports_storyboard_reference=True,
+            supports_multishot=True,
+            minimum_output_seconds=float(self._clip_duration_seconds),
+            maximum_output_seconds=float(self._clip_duration_seconds),
+            maximum_reference_images=10,
+            supports_first_frame=True,
+            supports_last_frame=False,
+        )
 
     async def animate(
         self,
@@ -155,6 +172,105 @@ class GeminiOmniVideoAssetGenerator:
             revision=image.revision,
         )
 
+    async def animate_storyboard(
+        self,
+        plans: list[VisualScenePlan],
+        storyboard: VisualArtifact,
+        output_dir: Path,
+        duration_seconds: float,
+        segment_number: int,
+    ) -> VisualArtifact:
+        if not plans:
+            raise ValueError("Storyboard animation requires at least one shot plan")
+        if any(plan.media_mode != MediaMode.VIDEO for plan in plans):
+            raise ValueError("Static shots must bypass storyboard-to-video")
+        if not storyboard.path.is_file() or storyboard.path.stat().st_size == 0:
+            raise ValueError(f"Storyboard does not exist or is empty: {storyboard.path}")
+        maximum_duration = self.capabilities.maximum_output_seconds
+        if duration_seconds > maximum_duration + 0.001:
+            raise ValueError(
+                f"Storyboard segment duration {duration_seconds:.2f}s exceeds the model "
+                f"maximum of {maximum_duration:.2f}s"
+            )
+
+        request_id = uuid.uuid4().hex
+        scene_number = storyboard.scene_number
+        stem = f"scene-{scene_number:03d}-storyboard-segment-{segment_number:03d}"
+        input_items: list[dict[str, str]] = []
+        storyboard_uri = (
+            f"{self._output_gcs_uri}/omni-input/{stem}-{request_id}{storyboard.path.suffix}"
+        )
+        await self._upload(storyboard.path, storyboard_uri)
+        input_items.append(
+            {
+                "type": "image",
+                "uri": storyboard_uri,
+                "mime_type": mimetypes.guess_type(storyboard.path.name)[0] or "image/jpeg",
+            }
+        )
+        prompt = self._storyboard_prompt(plans, duration_seconds)
+        output_uri = f"{self._output_gcs_uri}/omni-output/{stem}-{request_id}/"
+        response_format: dict[str, Any] = {
+            "type": "video",
+            "aspect_ratio": self._aspect_ratio,
+            "duration": f"{self._clip_duration_seconds}s",
+        }
+        if self._store_output_in_gcs:
+            response_format.update({"delivery": "uri", "gcs_uri": output_uri})
+        body = {
+            "model": self._model,
+            "input": [{"type": "text", "text": prompt}, *input_items],
+            "response_format": [response_format],
+            "generation_config": {"video_config": {"task": "image_to_video"}},
+        }
+        endpoint = (
+            "https://aiplatform.googleapis.com/v1beta1/projects/"
+            f"{self._project}/locations/global/interactions"
+        )
+        started_at = time.monotonic()
+        logger.info(
+            "Gemini Omni storyboard interaction submitting scene=%s segment=%s panels=%s "
+            "references=%s model=%s duration=%ss",
+            scene_number,
+            segment_number,
+            len(plans),
+            len(input_items),
+            self._model,
+            self._clip_duration_seconds,
+        )
+        response = await asyncio.to_thread(self._post, endpoint, body)
+        status = str(response.get("status", "")).lower()
+        if status and status != "completed":
+            raise RuntimeError(
+                f"Gemini Omni synchronous interaction ended with status {status!r}"
+            )
+        video = _video_content(response)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        destination = output_dir / f"{stem}.mp4"
+        if video.get("uri"):
+            await self._download(str(video["uri"]), destination)
+        elif video.get("data"):
+            destination.write_bytes(base64.b64decode(video["data"]))
+        else:
+            raise RuntimeError("Gemini Omni returned neither video URI nor inline data")
+        if not destination.is_file() or destination.stat().st_size == 0:
+            raise RuntimeError("Gemini Omni produced an empty storyboard video artifact")
+        logger.info(
+            "Gemini Omni storyboard interaction completed scene=%s segment=%s "
+            "elapsed_seconds=%.1f bytes=%s",
+            scene_number,
+            segment_number,
+            time.monotonic() - started_at,
+            destination.stat().st_size,
+        )
+        return VisualArtifact(
+            scene_number=scene_number,
+            shot_number=storyboard.shot_number,
+            path=destination,
+            kind="video",
+            revision=storyboard.revision,
+        )
+
     def _prompt(self, plan: VisualScenePlan) -> str:
         if "whiteboard animation" in plan.visual_style.lower():
             return (
@@ -177,6 +293,52 @@ class GeminiOmniVideoAssetGenerator:
             f"normal speed. Camera: {plan.camera_motion}. Entrance: {plan.entrance_motion}. "
             f"Action: {plan.focal_action}. End by {plan.transition_out}. "
             "Do not add text, captions, logos, interfaces, charts, or watermarks."
+        )
+
+    def _storyboard_prompt(
+        self,
+        plans: list[VisualScenePlan],
+        duration_seconds: float,
+    ) -> str:
+        elapsed = 0.0
+        beats: list[str] = []
+        explicit_durations = [
+            plan.emphasis_beats_seconds[0]
+            if plan.emphasis_beats_seconds
+            else 0.0
+            for plan in plans
+        ]
+        use_explicit_durations = (
+            all(duration > 0 for duration in explicit_durations)
+            and sum(explicit_durations) <= duration_seconds + 0.01
+        )
+        for index, plan in enumerate(plans, start=1):
+            remaining = max(duration_seconds - elapsed, 0.0)
+            beat_duration = (
+                explicit_durations[index - 1]
+                if use_explicit_durations
+                else remaining / max(len(plans) - index + 1, 1)
+            )
+            beats.append(
+                f"Panel {index}, {elapsed:.1f}s to {elapsed + beat_duration:.1f}s: "
+                f"{plan.focal_action}; camera {plan.camera_motion}; enter from "
+                f"{plan.entrance_motion}; finish in {plan.transition_out}."
+            )
+            elapsed += beat_duration
+        return (
+            "Animate the first supplied image as one continuous cinematic multi-shot sequence. "
+            "It is a clean storyboard grid read left-to-right and top-to-bottom; each cell is a "
+            "successive moment, never a simultaneous collage in the output video. Use one cell per "
+            "directed beat, with clean motivated cuts and continuous action across the cuts. Do not "
+            "show the storyboard borders or grid. Do not repeat, reverse, restart, or prematurely "
+            "complete an action. Preserve the environment, props, lighting, palette, spatial state, "
+            "and causal continuity from one beat to the next. Preserve every character identity, "
+            "face, body proportion, hairstyle, wardrobe, color, and accessory already established "
+            "inside the storyboard across all shots; never merge or recast them. Natural motion at "
+            "normal speed. No slow motion. "
+            "No audio. No text, captions, titles, labels, logos, interfaces, or watermarks. "
+            f"The target narrative interval is {duration_seconds:.1f} seconds. "
+            f"Shot directions: {' '.join(beats)}"
         )
 
     def _storage(self) -> Any:

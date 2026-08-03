@@ -108,10 +108,12 @@ def _definition() -> WorkflowDefinition:
 def test_default_workflow_yaml_is_valid() -> None:
     definition = WorkflowLoader(Path("workflows")).load("presentation-video")
 
-    assert definition.version == "2.6.0"
+    assert definition.version == "2.9.0"
     assert [step.id for step in definition.steps] == [
         "ingest",
+        "content_audit",
         "narrative",
+        "content_coverage",
         "duration_validate",
         "duration_review",
         "speech",
@@ -122,10 +124,13 @@ def test_default_workflow_yaml_is_valid() -> None:
         "prompt_compile",
         "rule_validate",
         "generate_images",
+        "character_references",
+        "storyboard",
         "whiteboard_master",
         "whiteboard_states",
         "visual_review",
         "animate",
+        "storyboard_animate",
         "whiteboard_animate",
         "visual_qa",
         "render",
@@ -142,12 +147,17 @@ def test_default_workflow_yaml_is_valid() -> None:
     assert configs["generate_images"]["model_input"]["aspect_ratio"] == "1536x1024"
     assert configs["whiteboard_master"]["lock_final_composition"] is True
     assert configs["whiteboard_states"]["cumulative"] is True
+    assert configs["whiteboard_states"]["target_take_seconds"] == 2
+    assert configs["whiteboard_animate"]["model_input"]["duration"] == 4
     assert configs["instructional_design"]["allow_generated_readable_text"] is False
     assert configs["speech"]["voice"] == "Kore"
     assert configs["scene_plan"]["informational_scenes"]["preserve_as_static"] is True
+    assert "approval_matrix" in configs["content_audit"]["signals"]
+    assert configs["content_coverage"]["reject_page_only_coverage"] is True
     assert configs["duration_validate"]["tolerance_percent"] == 5
     assert configs["captions"]["formats"] == ["webvtt", "srt"]
     assert configs["captions"]["burn_in"] is False
+    assert all(step.description.strip() for step in definition.steps)
 
 
 def test_pydantic_ai_workflow_yaml_is_valid() -> None:
@@ -155,12 +165,93 @@ def test_pydantic_ai_workflow_yaml_is_valid() -> None:
     configs = {step.id: step.config for step in definition.steps}
 
     assert definition.id == "presentation-video-pydantic-ai"
+    assert definition.version == "2.9.0"
+    assert "approval_matrix" in configs["content_audit"]["signals"]
     assert configs["narrative"]["provider"] == "pydantic_ai"
     assert configs["narrative"]["model"] == "google-cloud:gemini-3.5-flash"
     assert configs["visual_plan"]["provider"] == "pydantic_ai"
     assert configs["generate_images"]["provider"] == "vertex_ai"
     assert configs["animate"]["provider"] == "vertex_ai"
     assert configs["speech"]["provider"] == "vertex_ai"
+    assert all(step.description.strip() for step in definition.steps)
+
+
+def test_seedance_fast_workflow_inherits_graph_and_overrides_video_model() -> None:
+    loader = WorkflowLoader(Path("workflows"))
+    base = loader.load("presentation-video-pydantic-ai")
+    definition = loader.load("presentation-video-seedance-fast")
+    configs = {step.id: step.config for step in definition.steps}
+
+    assert definition.id == "presentation-video-seedance-fast"
+    assert [step.id for step in definition.steps] == [step.id for step in base.steps]
+    assert configs["narrative"]["provider"] == "pydantic_ai"
+    assert configs["visual_plan"]["provider"] == "pydantic_ai"
+    assert configs["generate_images"]["provider"] == "vertex_ai"
+    assert configs["speech"]["provider"] == "vertex_ai"
+    assert configs["animate"]["provider"] == "replicate"
+    assert configs["animate"]["model"] == "bytedance/seedance-2.0-fast"
+    assert configs["animate"]["model_input"] == {
+        "aspect_ratio": "16:9",
+        "duration": 8,
+        "resolution": "480p",
+        "generate_audio": False,
+    }
+    assert configs["whiteboard_animate"]["provider"] == "replicate"
+    assert configs["whiteboard_animate"]["model"] == "bytedance/seedance-2.0-fast"
+    assert configs["whiteboard_animate"]["model_input"] == {
+        "aspect_ratio": "16:9",
+        "duration": 4,
+        "resolution": "480p",
+        "generate_audio": False,
+    }
+    assert configs["storyboard_animate"]["provider_config_from"] == "animate"
+    assert "location" not in configs["animate"]
+    assert "duration_seconds" not in configs["animate"]
+
+
+def test_workflow_loader_merges_inherited_step_configuration(tmp_path: Path) -> None:
+    (tmp_path / "base.yaml").write_text(
+        """
+id: base
+version: 1.0.0
+steps:
+  - id: animate
+    uses: videos.generate
+    parallelism: 3
+    config:
+      provider: replicate
+      model: old/model
+      model_input:
+        duration: 8
+        resolution: 720p
+""".strip(),
+        encoding="utf-8",
+    )
+    (tmp_path / "variant.yaml").write_text(
+        """
+extends: base
+id: variant
+version: 1.0.0
+steps:
+  - id: animate
+    config:
+      model: new/model
+      model_input:
+        resolution: 480p
+""".strip(),
+        encoding="utf-8",
+    )
+
+    definition = WorkflowLoader(tmp_path).load("variant")
+    step = definition.steps[0]
+
+    assert definition.id == "variant"
+    assert step.parallelism == 3
+    assert step.config == {
+        "provider": "replicate",
+        "model": "new/model",
+        "model_input": {"duration": 8, "resolution": "480p"},
+    }
 
 
 def test_sqlite_contains_state_only_and_survives_repository_recreation(

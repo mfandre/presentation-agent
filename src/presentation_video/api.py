@@ -111,6 +111,8 @@ class SceneImageView(BaseModel):
     instructional_type: str | None = None
     learning_objective: str = ""
     allow_readable_text: bool = False
+    locked_static: bool = False
+    critical_information_titles: list[str] = Field(default_factory=list)
 
 
 class RegenerateSceneRequest(BaseModel):
@@ -166,6 +168,17 @@ class SourcePageView(BaseModel):
     image_url: str
 
 
+class CharacterReferenceView(BaseModel):
+    character_id: str
+    image_url: str
+
+
+class StoryboardSheetView(BaseModel):
+    sheet_number: int
+    image_url: str
+    panel_numbers: list[int]
+
+
 class DurationDecisionRequest(BaseModel):
     decision: Literal["summarize", "accept", "cancel"]
 
@@ -207,6 +220,8 @@ class JobView(BaseModel):
     creative_direction: CreativeDirection | None = None
     brand_kit: BrandKitView | None = None
     source_pages: list[SourcePageView] = Field(default_factory=list)
+    character_references: list[CharacterReferenceView] = Field(default_factory=list)
+    storyboard_sheets: list[StoryboardSheetView] = Field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -262,6 +277,8 @@ _STAGE_PROGRESS: dict[JobStatus, tuple[int, int]] = {
     JobStatus.VISUAL_PLANNING: (31, 35),
     JobStatus.PROMPT_COMPILING: (35, 37),
     JobStatus.RULE_VALIDATING: (37, 39),
+    JobStatus.DESIGNING_CHARACTERS: (39, 45),
+    JobStatus.STORYBOARDING: (45, 55),
     JobStatus.GENERATING_IMAGES: (39, 55),
     JobStatus.AWAITING_VISUAL_APPROVAL: (55, 55),
     JobStatus.GENERATING_VIDEO: (65, 82),
@@ -277,7 +294,9 @@ _ITEM_PROGRESS_PATTERN = re.compile(r"(?:completed|slide)=(\d+)\s+total=(\d+)")
 _JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _WORKFLOW_STEP_TO_JOB_STATUS: dict[str, JobStatus] = {
     "ingest": JobStatus.INGESTING,
+    "content_audit": JobStatus.INGESTING,
     "narrative": JobStatus.SCRIPTING,
+    "content_coverage": JobStatus.DURATION_VALIDATING,
     "duration_validate": JobStatus.DURATION_VALIDATING,
     "duration_review": JobStatus.AWAITING_DURATION_APPROVAL,
     "scene_plan": JobStatus.SCENE_PLANNING,
@@ -286,12 +305,15 @@ _WORKFLOW_STEP_TO_JOB_STATUS: dict[str, JobStatus] = {
     "whiteboard_concept_plan": JobStatus.VISUAL_PLANNING,
     "prompt_compile": JobStatus.PROMPT_COMPILING,
     "rule_validate": JobStatus.RULE_VALIDATING,
+    "character_references": JobStatus.DESIGNING_CHARACTERS,
+    "storyboard": JobStatus.STORYBOARDING,
     "generate_images": JobStatus.GENERATING_IMAGES,
     "whiteboard_master": JobStatus.GENERATING_IMAGES,
     "whiteboard_states": JobStatus.GENERATING_IMAGES,
     "visual_review": JobStatus.AWAITING_VISUAL_APPROVAL,
     "speech": JobStatus.SYNTHESIZING,
     "animate": JobStatus.GENERATING_VIDEO,
+    "storyboard_animate": JobStatus.GENERATING_VIDEO,
     "whiteboard_animate": JobStatus.GENERATING_VIDEO,
     "visual_qa": JobStatus.VISUAL_QA,
     "render": JobStatus.RENDERING,
@@ -411,13 +433,13 @@ def _recover_workflow_job(job_id: str) -> JobRecord | None:
         ),
         None,
     )
-    status = (
-        JobStatus.FAILED
-        if snapshot.run.status == RunStatus.FAILED
-        else _WORKFLOW_STEP_TO_JOB_STATUS.get(
-            active_step.step_id if active_step else "",
-            JobStatus.RECEIVED,
-        )
+    terminal_status = {
+        RunStatus.FAILED: JobStatus.FAILED,
+        RunStatus.CANCELLED: JobStatus.CANCELLED,
+    }.get(snapshot.run.status)
+    status = terminal_status or _WORKFLOW_STEP_TO_JOB_STATUS.get(
+        active_step.step_id if active_step else "",
+        JobStatus.RECEIVED,
     )
     created_at = snapshot.run.created_at
     output_dir = settings.output_root / job_id
@@ -597,6 +619,38 @@ def _source_page_views(prepared: PreparedVideoJob) -> list[SourcePageView]:
     ]
 
 
+def _storyboard_asset_views(
+    prepared: PreparedVideoJob,
+) -> tuple[list[CharacterReferenceView], list[StoryboardSheetView]]:
+    references = [
+        CharacterReferenceView(
+            character_id=reference.character_id,
+            image_url=(
+                f"/v1/videos/{prepared.job_id}/characters/"
+                f"{reference.character_id}/reference"
+            ),
+        )
+        for reference in prepared.character_references
+    ]
+    sheets = [
+        StoryboardSheetView(
+            sheet_number=sheet.sheet_number,
+            image_url=(
+                f"/v1/videos/{prepared.job_id}/storyboards/"
+                f"{sheet.sheet_number}/review"
+            ),
+            panel_numbers=sheet.panel_numbers,
+        )
+        for sheet in (prepared.storyboard.sheets if prepared.storyboard else [])
+    ]
+    return references, sheets
+
+
+def _set_prepared_asset_views(view: JobView, prepared: PreparedVideoJob) -> None:
+    view.scene_images = _scene_image_views(prepared)
+    view.character_references, view.storyboard_sheets = _storyboard_asset_views(prepared)
+
+
 def _scene_image_views_from_assets(
     job_id: str,
     visual_plan: PresentationVisualPlan,
@@ -632,22 +686,34 @@ def _scene_image_views_from_assets(
                 transition_preset=(shot.transition if shot else plan.transition_preset).value,
                 visual_beats=plan.visual_beats,
                 revision=image.revision,
-                media_mode=plan.media_mode,
+                media_mode=shot.media_mode if shot else plan.media_mode,
                 story_beat=plan.story_beat,
-                must_show_concepts=plan.must_show_concepts,
+                must_show_concepts=(
+                    shot.required_concepts if shot and shot.required_concepts else plan.must_show_concepts
+                ),
                 concept_visualization=plan.concept_visualization,
                 scene_purpose=plan.scene_purpose,
                 relationship_to_thesis=plan.relationship_to_thesis,
                 narrative_progress=plan.narrative_progress,
                 visible_evidence=plan.visible_evidence,
                 forbidden_substitutions=plan.forbidden_substitutions,
-                source_slide_number=plan.source_slide_number,
-                preserve_source_frame=plan.preserve_source_frame,
+                source_slide_number=(shot.source_slide_number if shot else plan.source_slide_number),
+                preserve_source_frame=(
+                    shot.preserve_source_frame if shot else plan.preserve_source_frame
+                ),
                 instructional_type=(
                     plan.instructional_type.value if plan.instructional_type else None
                 ),
                 learning_objective=plan.learning_objective,
-                allow_readable_text=plan.allow_readable_text,
+                allow_readable_text=(
+                    True if shot and shot.critical_information else plan.allow_readable_text
+                ),
+                locked_static=image.locked_static or bool(shot and shot.locked_static),
+                critical_information_titles=(
+                    [unit.title for unit in shot.critical_information]
+                    if shot
+                    else [unit.title for unit in plan.critical_information]
+                ),
             )
         )
     return views
@@ -902,7 +968,7 @@ async def _prepare_job(
             record.visual_plan_path = prepared.visual_plan_path
             record.view.script_url = f"/v1/videos/{job_id}/script"
             record.view.visual_plan_url = f"/v1/videos/{job_id}/visual-plan"
-            record.view.scene_images = _scene_image_views(prepared)
+            _set_prepared_asset_views(record.view, prepared)
             record.view.source_pages = _source_page_views(prepared)
             record.view.creative_direction = prepared.script.creative_direction
             if prepared.request.brand_kit is not None:
@@ -930,20 +996,20 @@ async def _prepare_job(
             exc.word_count,
         )
         async with _jobs_lock:
-            record = _jobs.get(job_id)
-            if record is not None:
-                record.script_path = settings.output_root / job_id / "script.json"
-                record.view.script_url = f"/v1/videos/{job_id}/script"
-                record.view.status = JobStatus.AWAITING_DURATION_APPROVAL
-                record.view.progress_percent = 23
-                record.view.detail = (
+            duration_record = _jobs.get(job_id)
+            if duration_record is not None:
+                duration_record.script_path = settings.output_root / job_id / "script.json"
+                duration_record.view.script_url = f"/v1/videos/{job_id}/script"
+                duration_record.view.status = JobStatus.AWAITING_DURATION_APPROVAL
+                duration_record.view.progress_percent = 23
+                duration_record.view.detail = (
                     f"A história foi estimada em {exc.estimated_seconds} segundos, acima dos "
                     f"{exc.requested_seconds} segundos solicitados."
                 )
-                record.view.requested_target_seconds = exc.requested_seconds
-                record.view.estimated_duration_seconds = exc.estimated_seconds
-                record.view.narration_word_count = exc.word_count
-                record.view.updated_at = datetime.now(UTC)
+                duration_record.view.requested_target_seconds = exc.requested_seconds
+                duration_record.view.estimated_duration_seconds = exc.estimated_seconds
+                duration_record.view.narration_word_count = exc.word_count
+                duration_record.view.updated_at = datetime.now(UTC)
     except Exception as exc:
         logger.exception("job=%s background preparation failed", job_id)
         async with _jobs_lock:
@@ -1215,7 +1281,12 @@ async def cancel_video(job_id: str) -> JobView:
     async with _jobs_lock:
         record = _jobs.get(job_id)
         if record is None:
-            raise HTTPException(status_code=404, detail="Job not found")
+            record = _recover_workflow_job(job_id)
+            if record is None:
+                record = _recover_completed_job(job_id)
+            if record is None:
+                raise HTTPException(status_code=404, detail="Job not found")
+            _jobs[job_id] = record
         if record.view.status == JobStatus.CANCELLED:
             return record.view.model_copy(deep=True)
         if record.view.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
@@ -1351,6 +1422,48 @@ async def get_source_page_image(
     return FileResponse(slide.image_path)
 
 
+@app.get("/v1/videos/{job_id}/characters/{character_id}/reference")
+async def get_character_reference(job_id: str, character_id: str) -> FileResponse:
+    async with _jobs_lock:
+        record = _jobs.get(job_id)
+        reference = (
+            next(
+                (
+                    item
+                    for item in record.prepared.character_references
+                    if item.character_id == character_id
+                ),
+                None,
+            )
+            if record and record.prepared
+            else None
+        )
+    if reference is None or not reference.path.is_file():
+        raise HTTPException(status_code=404, detail="Character reference not found")
+    return FileResponse(reference.path)
+
+
+@app.get("/v1/videos/{job_id}/storyboards/{sheet_number}/review")
+async def get_storyboard_review(job_id: str, sheet_number: int) -> FileResponse:
+    async with _jobs_lock:
+        record = _jobs.get(job_id)
+        sheet = (
+            next(
+                (
+                    item
+                    for item in record.prepared.storyboard.sheets
+                    if item.sheet_number == sheet_number
+                ),
+                None,
+            )
+            if record and record.prepared and record.prepared.storyboard
+            else None
+        )
+    if sheet is None or not sheet.review_path.is_file():
+        raise HTTPException(status_code=404, detail="Storyboard review sheet not found")
+    return FileResponse(sheet.review_path)
+
+
 @app.get("/v1/videos/{job_id}/scenes/{scene_number}/shots/{shot_number}/image")
 async def get_shot_image(job_id: str, scene_number: int, shot_number: int) -> FileResponse:
     async with _jobs_lock:
@@ -1418,7 +1531,7 @@ async def use_source_slide(
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        record.view.scene_images = _scene_image_views(prepared)
+        _set_prepared_asset_views(record.view, prepared)
         record.view.updated_at = datetime.now(UTC)
         return record.view.model_copy(deep=True)
 
@@ -1481,7 +1594,7 @@ async def generate_scene_from_source_slide(
                 )
     async with _jobs_lock:
         record = _jobs[job_id]
-        record.view.scene_images = _scene_image_views(prepared)
+        _set_prepared_asset_views(record.view, prepared)
         record.view.updated_at = datetime.now(UTC)
         return record.view.model_copy(deep=True)
 
@@ -1546,7 +1659,7 @@ async def regenerate_scene_image(
     async with _jobs_lock:
         record = _jobs[job_id]
         if record.prepared is not None:
-            record.view.scene_images = _scene_image_views(record.prepared)
+            _set_prepared_asset_views(record.view, record.prepared)
         return record.view.model_copy(deep=True)
 
 
@@ -1763,7 +1876,7 @@ async def resume_video(job_id: str) -> JobView:
             record.view.updated_at = now
             record.view.script_url = f"/v1/videos/{job_id}/script"
             record.view.visual_plan_url = f"/v1/videos/{job_id}/visual-plan"
-            record.view.scene_images = _scene_image_views(prepared)
+            _set_prepared_asset_views(record.view, prepared)
             record.view.source_pages = _source_page_views(prepared)
             record.view.creative_direction = prepared.script.creative_direction
             if prepared.request.brand_kit is not None:

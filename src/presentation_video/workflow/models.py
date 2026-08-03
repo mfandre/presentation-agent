@@ -40,6 +40,7 @@ class WorkflowInputDefinition(BaseModel):
 class WorkflowStepDefinition(BaseModel):
     id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
     uses: str = Field(pattern=r"^[a-z][a-z0-9_.-]*$")
+    description: str = ""
     needs: list[str] = Field(default_factory=list)
     inputs: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)

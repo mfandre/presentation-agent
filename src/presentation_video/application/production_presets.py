@@ -46,6 +46,51 @@ class ProductionPreset(BaseModel):
     options: list[PresetOption] = Field(default_factory=list)
 
 
+_CINEMATIC_VISUAL_STYLES = {
+    "disney_animation": (
+        "polished hand-drawn feature animation with expressive original characters, graceful "
+        "silhouettes, storybook environments, warm cinematic lighting, and elegant staging"
+    ),
+    "pixar_style_3d": (
+        "polished stylized 3D feature animation with original character designs, appealing "
+        "proportions, expressive faces, tactile materials, soft global illumination, and "
+        "cinematic depth"
+    ),
+    "anime": (
+        "cinematic anime with precise linework, expressive character acting, controlled cel "
+        "shading, atmospheric backgrounds, and dynamic but readable compositions"
+    ),
+    "live_action": (
+        "cinematic live action with believable actors, natural anatomy and materials, practical "
+        "locations, filmic lighting, realistic lenses, and restrained color grading"
+    ),
+    "stylized_3d": (
+        "stylized 3D animation with coherent simplified forms, expressive proportions, crafted "
+        "materials, cinematic lighting, and a consistent production-design language"
+    ),
+    "comic_book": (
+        "cinematic comic-book art with confident ink contours, graphic shadows, controlled "
+        "halftone texture, dramatic perspective, and consistent illustrated character design"
+    ),
+    "fantasy": (
+        "cinematic fantasy with handcrafted world-building, atmospheric natural magic, richly "
+        "textured costumes and environments, painterly light, and grounded character acting"
+    ),
+    "sci_fi": (
+        "cinematic science fiction with coherent functional technology, disciplined production "
+        "design, atmospheric lighting, tactile materials, and grounded human-scale environments"
+    ),
+    "horror": (
+        "atmospheric cinematic horror with suspenseful framing, low-key lighting, restrained color, "
+        "psychological tension, and safe non-graphic imagery without gore or explicit violence"
+    ),
+    "stop_motion": (
+        "handcrafted stop-motion animation with consistent miniature-scale characters, tactile "
+        "fabric and sculpted materials, practical sets, subtle frame-by-frame motion, and cinematic light"
+    ),
+}
+
+
 _PRESETS = (
     ProductionPreset(
         id=ProductionMode.HYBRID_PRESENTATION,
@@ -71,6 +116,43 @@ _PRESETS = (
             "hook, escalating development, recurring visual motifs, meaningful "
             "transitions, and a clear resolution."
         ),
+        options=[
+            PresetOption(
+                id="speech_mode",
+                label="Voz do vídeo",
+                type="select",
+                default="narration",
+                choices=[
+                    PresetChoice(value="narration", label="Narração"),
+                    PresetChoice(
+                        value="character_dialogue",
+                        label="Diálogo entre personagens",
+                    ),
+                ],
+            ),
+            PresetOption(
+                id="visual_style",
+                label="Visual style",
+                type="select",
+                default="default",
+                choices=[
+                    PresetChoice(
+                        value="default",
+                        label="Default — realistic editorial documentary",
+                    ),
+                    PresetChoice(value="disney_animation", label="Disney animation"),
+                    PresetChoice(value="pixar_style_3d", label="Pixar-style 3D"),
+                    PresetChoice(value="anime", label="Anime"),
+                    PresetChoice(value="live_action", label="Live action"),
+                    PresetChoice(value="stylized_3d", label="Stylized 3D"),
+                    PresetChoice(value="comic_book", label="Comic book"),
+                    PresetChoice(value="fantasy", label="Fantasy"),
+                    PresetChoice(value="sci_fi", label="Sci-fi"),
+                    PresetChoice(value="horror", label="Horror"),
+                    PresetChoice(value="stop_motion", label="Stop motion"),
+                ],
+            )
+        ],
     ),
     ProductionPreset(
         id=ProductionMode.WHITEBOARD_EXPLAINER,
@@ -149,9 +231,28 @@ def get_production_preset(mode: ProductionMode) -> ProductionPreset:
     return _REGISTRY[mode]
 
 
-def direct_narrative_tone(mode: ProductionMode, tone: str) -> str:
+def direct_narrative_tone(
+    mode: ProductionMode,
+    tone: str,
+    options: dict[str, str] | None = None,
+) -> str:
     direction = get_production_preset(mode).narrative_direction
-    return f"{tone}. {direction}" if direction else tone
+    directed_tone = f"{tone}. {direction}" if direction else tone
+    if (
+        mode == ProductionMode.CINEMATIC_STORY
+        and (options or {}).get("speech_mode") == "character_dialogue"
+    ):
+        return (
+            f"{directed_tone}. SPEECH MODE: CHARACTER DIALOGUE. Tell the story through "
+            "natural spoken exchanges between recurring on-screen characters, not through an "
+            "omniscient narrator or voice-over. Every scene must populate dialogue with ordered "
+            "lines containing character_id, character_name, text, and emotion. Reuse the same "
+            "lowercase character_id across scenes. Keep each exchange concise and performable. "
+            "The narration field must contain exactly the dialogue texts joined in speaking "
+            "order, without speaker labels or additional narration. Do not write stage directions "
+            "inside spoken text."
+        )
+    return directed_tone
 
 
 def transform_script(mode: ProductionMode, script: PresentationScript) -> PresentationScript:
@@ -168,7 +269,111 @@ def transform_visual_plan(
 ) -> PresentationVisualPlan:
     strategy = get_production_preset(mode).strategy
     if strategy == "cinematic":
-        return enforce_cinematic_visual_plan(plan)
+        cinematic = enforce_cinematic_visual_plan(plan)
+        if (options or {}).get("speech_mode") == "character_dialogue" and script is not None:
+            dialogue_by_scene = {
+                scene.scene_number: scene.dialogue
+                for scene in script.scenes
+                if scene.dialogue
+            }
+            cinematic = cinematic.model_copy(
+                update={
+                    "scenes": [
+                        scene.model_copy(
+                            update={
+                                "prompt": (
+                                    f"{scene.prompt} DIALOGUE PERFORMANCE: "
+                                    + " | ".join(
+                                        f"{line.character_name} ({line.emotion}): {line.text}"
+                                        for line in dialogue_by_scene.get(
+                                            scene.scene_number, []
+                                        )
+                                    )
+                                    + ". Show natural conversational acting: the active speaker "
+                                    "moves their mouth and body naturally while the other "
+                                    "characters listen and react. Never show dialogue as text."
+                                ),
+                                "focal_action": (
+                                    "perform the scripted character exchange with natural "
+                                    "speaker and listener reactions"
+                                ),
+                            }
+                        )
+                        if dialogue_by_scene.get(scene.scene_number)
+                        else scene
+                        for scene in cinematic.scenes
+                    ]
+                }
+            )
+        selected_style = str((options or {}).get("visual_style") or "default")
+        style = _CINEMATIC_VISUAL_STYLES.get(selected_style)
+        if style is None:
+            return cinematic
+        locked_style = (
+            f"LOCKED VISUAL STYLE FOR THE ENTIRE FILM: {style}. Keep exactly this rendering "
+            "medium, character-design language, material treatment, lighting logic, and level of "
+            "stylization in every character sheet, storyboard panel, generated frame, and video "
+            "take. Never switch to another medium or mix 2D, 3D, live action, comic, anime, or "
+            "stop-motion treatments between scenes."
+        )
+        conflicting_terms = {
+            "disney_animation": ("vector", "illustration", "drawing", "cartoon", "digital art"),
+            "pixar_style_3d": (
+                "vector",
+                "illustration",
+                "drawing",
+                "cartoon",
+                "3d render",
+                "3d digital",
+                "digital art",
+            ),
+            "anime": ("vector", "illustration", "drawing", "cartoon", "digital art"),
+            "stylized_3d": (
+                "vector",
+                "illustration",
+                "drawing",
+                "cartoon",
+                "3d render",
+                "3d digital",
+                "digital art",
+            ),
+            "comic_book": ("vector", "illustration", "drawing", "cartoon", "digital art"),
+            "stop_motion": ("stop-motion", "stop motion", "miniature", "toy model", "clay"),
+        }.get(selected_style, ())
+
+        def compatible(values: list[str]) -> list[str]:
+            return [
+                value
+                for value in values
+                if not any(term in value.casefold() for term in conflicting_terms)
+            ]
+
+        scenes = [
+            scene.model_copy(
+                update={
+                    "prompt": f"{scene.prompt} {locked_style}",
+                    "visual_style": locked_style,
+                    "negative_prompt": ", ".join(
+                        compatible(
+                            [
+                                part.strip()
+                                for part in scene.negative_prompt.split(",")
+                                if part.strip()
+                            ]
+                        )
+                        + [
+                            "mixed visual styles",
+                            "style drift",
+                            "medium change",
+                            "inconsistent rendering technique",
+                        ]
+                    ),
+                    "forbidden_substitutions": compatible(scene.forbidden_substitutions),
+                }
+            )
+            for scene in cinematic.scenes
+        ]
+        return cinematic.model_copy(update={"scenes": scenes})
     if strategy == "training":
         if script is None:
             raise ValueError("corporate training visual direction requires the narrative script")
@@ -189,7 +394,7 @@ def transform_visual_plan(
         "dynamic": "Reveal elements briskly with energetic arrows and concise transitions. ",
         "summary": "Keep each composition extremely concise, showing only the essential takeaway. ",
     }.get(
-        selected.get("pacing"),
+        str(selected.get("pacing") or ""),
         "Reveal one teaching idea at a time at a calm, easy-to-follow pace. ",
     )
     scenes = []

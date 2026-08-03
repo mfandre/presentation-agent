@@ -1,0 +1,41 @@
+extends: presentation-video-pydantic-ai
+
+id: presentation-video-seedance-fast
+version: 2.9.0
+description: Produção de vídeo narrado usando Seedance 2.0 Fast em 480p e sem áudio nativo.
+
+steps:
+  - id: animate
+    config:
+      $replace:
+        provider: replicate
+        model: bytedance/seedance-2.0-fast
+        secrets:
+          api_token: REPLICATE_API_TOKEN
+        image_input_key: image
+        model_input:
+          aspect_ratio: "16:9"
+          duration: 8
+          resolution: 480p
+          generate_audio: false
+        poll_interval_seconds: 2
+        timeout_seconds: 900
+
+  - id: whiteboard_animate
+    config:
+      $replace:
+        provider: replicate
+        model: bytedance/seedance-2.0-fast
+        transition: previous_state_to_approved_end_state
+        preserve_existing_marks: true
+        natural_drawing_speed: true
+        secrets:
+          api_token: REPLICATE_API_TOKEN
+        image_input_key: image
+        model_input:
+          aspect_ratio: "16:9"
+          duration: 4
+          resolution: 480p
+          generate_audio: false
+        poll_interval_seconds: 2
+        timeout_seconds: 900

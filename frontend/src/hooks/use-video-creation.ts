@@ -31,6 +31,7 @@ const POLLING_STOP_STATUSES = new Set([
   "cancelled",
   "failed",
 ]);
+const TERMINAL_STATUSES = new Set(["completed", "cancelled", "failed"]);
 const STORED_JOB_KEY = "presentation-video-active-job";
 
 const defaultGateway: VideoGateway = new HttpVideoGateway();
@@ -249,7 +250,7 @@ export function useVideoCreation(
   }, [gateway, job]);
 
   const cancelVideo = useCallback(async () => {
-    if (!job || POLLING_STOP_STATUSES.has(job.status)) return;
+    if (!job || TERMINAL_STATUSES.has(job.status)) return;
     setIsActing(true);
     setError(null);
     try {

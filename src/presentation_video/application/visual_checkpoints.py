@@ -4,10 +4,17 @@ import asyncio
 import logging
 from pathlib import Path
 
+from pydantic import TypeAdapter
+
 from presentation_video.application.cinematic import materialize_shot
+from presentation_video.application.content_audit import (
+    validate_visual_critical_information_coverage,
+)
+from presentation_video.application.information_cards import render_information_card
 from presentation_video.application.production_policy import shots_or_default
 from presentation_video.application.production_presets import validate_preset_plan
 from presentation_video.application.production_presets import transform_visual_plan
+from presentation_video.application.storyboard import generate_storyboard_bundle
 from presentation_video.application.brand import apply_brand_kit
 from presentation_video.application.brand import apply_brand_images
 from presentation_video.application.whiteboard_states import (
@@ -15,11 +22,13 @@ from presentation_video.application.whiteboard_states import (
 )
 from presentation_video.domain.models import (
     JobStatus,
+    CharacterReferenceArtifact,
     MediaMode,
     PreparedVideoJob,
     PresentationScript,
     PresentationVisualPlan,
     ProductionMode,
+    StoryboardBundle,
     VideoJobRequest,
     VisualArtifact,
 )
@@ -59,6 +68,13 @@ async def restore_prepared_job(
         work_dir,
     )
     script = PresentationScript.model_validate_json(script_path.read_text(encoding="utf-8"))
+    document = document.model_copy(
+        update={
+            "critical_information": [
+                unit for scene in script.scenes for unit in scene.critical_information
+            ]
+        }
+    )
     visual_plan = PresentationVisualPlan.model_validate_json(
         visual_plan_path.read_text(encoding="utf-8")
     )
@@ -74,12 +90,54 @@ async def restore_prepared_job(
             )
             visual_plan = apply_brand_kit(visual_plan, request.brand_kit)
         validate_preset_plan(request.production_mode, visual_plan)
+    if request.production_mode != ProductionMode.CINEMATIC_STORY:
+        validate_visual_critical_information_coverage(visual_plan, script)
     visual_plan_path.write_text(visual_plan.model_dump_json(indent=2), encoding="utf-8")
     slides = {slide.number: slide for slide in document.slides}
     scripts = {scene.scene_number: scene for scene in script.scenes}
     images: list[VisualArtifact] = []
     completed_images = 0
     shot_total = sum(max(len(plan.shots), 1) for plan in visual_plan.scenes)
+    storyboard_path = work_dir / "storyboard" / "storyboard-plan.json"
+    if request.production_mode == ProductionMode.CINEMATIC_STORY and storyboard_path.is_file():
+        stored_storyboard = StoryboardBundle.model_validate_json(
+            storyboard_path.read_text(encoding="utf-8")
+        )
+        references_path = work_dir / "character-references" / "references.json"
+        character_references = (
+            TypeAdapter(list[CharacterReferenceArtifact]).validate_json(
+                references_path.read_text(encoding="utf-8")
+            )
+            if references_path.is_file()
+            else []
+        )
+        panels_per_sheet = max(
+            (len(sheet.panel_numbers) for sheet in stored_storyboard.sheets),
+            default=9,
+        )
+        storyboard, images = await generate_storyboard_bundle(
+            visual_plan,
+            script,
+            character_references,
+            visual_asset_generator,
+            work_dir / "storyboard",
+            asyncio.Semaphore(1),
+            panels_per_sheet=panels_per_sheet,
+        )
+        return PreparedVideoJob(
+            job_id=job_id,
+            request=request,
+            document=document,
+            script=script,
+            visual_plan=visual_plan,
+            visual_images=apply_brand_images(images, request.brand_kit),
+            character_references=character_references,
+            storyboard=storyboard,
+            work_dir=work_dir,
+            output_dir=output_dir,
+            script_path=script_path,
+            visual_plan_path=visual_plan_path,
+        )
     if request.production_mode == ProductionMode.WHITEBOARD_EXPLAINER:
         for scene_plan in visual_plan.scenes:
             state_count = len(scene_plan.shots)
@@ -119,6 +177,23 @@ async def restore_prepared_job(
                     state_count,
                     work_dir / "images",
                 )
+            for shot in scene_plan.shots:
+                if not shot.locked_static or not shot.critical_information:
+                    continue
+                states[shot.shot_number - 1] = await asyncio.to_thread(
+                    render_information_card,
+                    shot.critical_information,
+                    work_dir
+                    / "images"
+                    / (
+                        f"scene-{scene_plan.scene_number:03d}-shot-"
+                        f"{shot.shot_number:03d}-exact-r1.png"
+                    ),
+                    scene_number=scene_plan.scene_number,
+                    shot_number=shot.shot_number,
+                    production_mode=request.production_mode,
+                    brand=request.brand_kit,
+                )
             images.extend(states)
             completed_images += len(states)
             await reporter.update(
@@ -141,17 +216,35 @@ async def restore_prepared_job(
         )
 
     for scene_plan in visual_plan.scenes:
-        for shot in shots_or_default(scene_plan.shots):
-            shot_number = shot.shot_number if shot else 1
-            plan = materialize_shot(scene_plan, shot) if shot else scene_plan
-            if plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
+        for candidate_shot in shots_or_default(scene_plan.shots):
+            shot_number = candidate_shot.shot_number if candidate_shot else 1
+            plan = materialize_shot(scene_plan, candidate_shot) if candidate_shot else scene_plan
+            if (
+                plan.media_mode == MediaMode.STATIC
+                and plan.critical_information
+                and not plan.preserve_source_frame
+            ):
+                card = await asyncio.to_thread(
+                    render_information_card,
+                    plan.critical_information,
+                    work_dir
+                    / "images"
+                    / (f"scene-{plan.scene_number:03d}-shot-{shot_number:03d}-exact-r1.png"),
+                    scene_number=plan.scene_number,
+                    shot_number=shot_number,
+                    production_mode=request.production_mode,
+                    brand=request.brand_kit,
+                )
+                image_path = card.path
+                revision = card.revision
+                source_number = None
+            elif plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
                 source_number = plan.source_slide_number or plan.source_slide_numbers[0]
                 try:
                     image_path = slides[source_number].image_path
                 except KeyError as exc:
                     raise FileNotFoundError(
-                        f"Source slide {source_number} is unavailable for scene "
-                        f"{plan.scene_number}"
+                        f"Source slide {source_number} is unavailable for scene {plan.scene_number}"
                     ) from exc
                 revision = 1
             else:
@@ -161,9 +254,7 @@ async def restore_prepared_job(
                 candidates = sorted((work_dir / "images").glob(f"{stem}-r*.*"))
                 if not candidates:
                     scene_script = scripts[plan.scene_number]
-                    source_slides = [
-                        slides[number] for number in scene_script.source_slide_numbers
-                    ]
+                    source_slides = [slides[number] for number in scene_script.source_slide_numbers]
                     logger.info(
                         "job=%s restoring missing generated image scene=%s shot=%s",
                         job_id,
@@ -180,11 +271,7 @@ async def restore_prepared_job(
                 else:
                     image_path = candidates[-1]
                     match = image_path.stem.rsplit("-r", 1)
-                    revision = (
-                        int(match[1])
-                        if len(match) == 2 and match[1].isdigit()
-                        else 1
-                    )
+                    revision = int(match[1]) if len(match) == 2 and match[1].isdigit() else 1
             images.append(
                 VisualArtifact(
                     scene_number=plan.scene_number,
@@ -194,10 +281,10 @@ async def restore_prepared_job(
                     revision=revision,
                     source_slide_number=(
                         source_number
-                        if plan.media_mode == MediaMode.STATIC
-                        and plan.preserve_source_frame
+                        if plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame
                         else None
                     ),
+                    locked_static=plan.media_mode == MediaMode.STATIC,
                 )
             )
             completed_images += 1
@@ -236,10 +323,7 @@ async def regenerate_visual(
     slides = {slide.number: slide for slide in prepared.document.slides}
     scripts = {scene.scene_number: scene for scene in prepared.script.scenes}
     plans = {plan.scene_number: plan for plan in prepared.visual_plan.scenes}
-    images = {
-        (image.scene_number, image.shot_number): image
-        for image in prepared.visual_images
-    }
+    images = {(image.scene_number, image.shot_number): image for image in prepared.visual_images}
     image_key = (scene_number, shot_number)
     if scene_number not in scripts or scene_number not in plans or image_key not in images:
         raise ValueError(f"Scene {scene_number}, shot {shot_number} does not exist")
@@ -248,12 +332,16 @@ async def regenerate_visual(
         and plans[scene_number].preserve_source_frame
     ):
         raise ValueError(
-            "Static scenes preserve an original source page and cannot be regenerated "
-            "from a prompt"
+            "Static scenes preserve an original source page and cannot be regenerated from a prompt"
         )
     scene_plan = plans[scene_number]
     shot = scene_plan.shots[shot_number - 1] if scene_plan.shots else None
     generation_plan = materialize_shot(scene_plan, shot) if shot else scene_plan
+    if generation_plan.media_mode == MediaMode.STATIC and generation_plan.critical_information:
+        raise ValueError(
+            "Exact information cards are rendered deterministically and cannot be regenerated "
+            "by an image model"
+        )
     previous_prompt = generation_plan.prompt
     if prompt is not None:
         if shot:
@@ -295,9 +383,7 @@ async def regenerate_visual(
         encoding="utf-8",
     )
     prepared.visual_images = [
-        replacement
-        if (image.scene_number, image.shot_number) == image_key
-        else image
+        replacement if (image.scene_number, image.shot_number) == image_key else image
         for image in prepared.visual_images
     ]
     logger.info(
@@ -444,19 +530,11 @@ async def regenerate_whiteboard_scene(
     """Regenerate one locked master and rebuild every cumulative state in its scene."""
 
     scene_plan = next(
-        (
-            plan
-            for plan in prepared.visual_plan.scenes
-            if plan.scene_number == scene_number
-        ),
+        (plan for plan in prepared.visual_plan.scenes if plan.scene_number == scene_number),
         None,
     )
     scene_script = next(
-        (
-            scene
-            for scene in prepared.script.scenes
-            if scene.scene_number == scene_number
-        ),
+        (scene for scene in prepared.script.scenes if scene.scene_number == scene_number),
         None,
     )
     if scene_plan is None or scene_script is None or not scene_plan.shots:
@@ -480,9 +558,7 @@ async def regenerate_whiteboard_scene(
     previous_prompt = scene_plan.prompt
     if prompt is not None:
         scene_plan.prompt = prompt.strip()
-    master_plan = scene_plan.model_copy(
-        update={"shots": [], "shot_number": 1}
-    )
+    master_plan = scene_plan.model_copy(update={"shots": [], "shot_number": 1})
     try:
         async with semaphore:
             master = await visual_asset_generator.generate(
@@ -507,8 +583,4 @@ async def regenerate_whiteboard_scene(
         prepared.visual_plan.model_dump_json(indent=2),
         encoding="utf-8",
     )
-    return next(
-        image
-        for image in states
-        if image.shot_number == requested_shot_number
-    )
+    return next(image for image in states if image.shot_number == requested_shot_number)

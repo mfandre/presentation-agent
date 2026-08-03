@@ -26,6 +26,8 @@ const STEPS: Array<{ status: JobStatus; label: string; description: string; icon
   { status: "visual_planning", label: "Dirigindo os visuais", description: "Classificação entre conteúdo animável e informacional estático", icon: Sparkles },
   { status: "prompt_compiling", label: "Compilando prompts", description: "Continuidade e instruções específicas para cada take", icon: Sparkles },
   { status: "rule_validating", label: "Validando as regras", description: "Cobertura do áudio, duração e restrições de mídia", icon: FileScan },
+  { status: "designing_characters", label: "Definindo os personagens", description: "Folhas canônicas para preservar identidade, figurino e proporções", icon: Sparkles },
+  { status: "storyboarding", label: "Criando o storyboard", description: "Narrativa visual contínua e recortes compatíveis com cada modelo", icon: Clapperboard },
   { status: "generating_images", label: "Gerando as imagens", description: "Criação dos frames-base para revisão", icon: Sparkles },
   { status: "generating_video", label: "Criando os clipes", description: "Movimento apenas nas cenas sem texto; slides permanecem fixos", icon: Clapperboard },
   { status: "visual_qa", label: "Validando os clipes", description: "Verificação dos artefatos antes da composição", icon: FileScan },
@@ -45,6 +47,8 @@ const ORDER: JobStatus[] = [
   "visual_planning",
   "prompt_compiling",
   "rule_validating",
+  "designing_characters",
+  "storyboarding",
   "generating_images",
   "awaiting_visual_approval",
   "generating_video",
@@ -82,6 +86,12 @@ export function ProcessingPanel({ job, error }: ProcessingPanelProps) {
     Math.floor((now - new Date(job.updated_at).getTime()) / 1_000),
   );
   const appearsStalled = secondsSinceUpdate >= 120;
+  const visibleSteps = STEPS.filter((step) => {
+    const cinematicOnly = step.status === "designing_characters" || step.status === "storyboarding";
+    if (cinematicOnly) return job.production_mode === "cinematic_story";
+    if (step.status === "generating_images") return job.production_mode !== "cinematic_story";
+    return true;
+  });
 
   return (
     <div className="processing-panel">
@@ -108,7 +118,7 @@ export function ProcessingPanel({ job, error }: ProcessingPanelProps) {
       {error && <div className="processing-error" role="alert">Falha ao consultar o job: {error}</div>}
 
       <div className="timeline">
-        {STEPS.map((step) => {
+        {visibleSteps.map((step) => {
           const state = stepState(step.status, job.status);
           const Icon = step.icon;
           return (

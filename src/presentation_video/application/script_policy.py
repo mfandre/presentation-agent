@@ -39,7 +39,25 @@ def compact_script(
         words = scene.narration.split()
         if len(words) <= budget:
             narration = scene.narration
+            dialogue = scene.dialogue
+        elif scene.dialogue:
+            remaining = budget
+            dialogue = []
+            for line in scene.dialogue:
+                if remaining <= 0:
+                    break
+                line_words = line.text.split()
+                kept_words = line_words[:remaining]
+                if not kept_words:
+                    continue
+                text = " ".join(kept_words)
+                if len(kept_words) < len(line_words):
+                    text = text.rstrip(".,;:") + "."
+                dialogue.append(line.model_copy(update={"text": text}))
+                remaining -= len(kept_words)
+            narration = " ".join(line.text for line in dialogue)
         else:
+            dialogue = scene.dialogue
             sentences = re.split(r"(?<=[.!?])\s+", scene.narration.strip())
             selected: list[str] = []
             used = 0
@@ -54,7 +72,9 @@ def compact_script(
                 if selected
                 else " ".join(words[:budget]).rstrip(".,;:") + "."
             )
-        scenes.append(scene.model_copy(update={"narration": narration}))
+        scenes.append(
+            scene.model_copy(update={"narration": narration, "dialogue": dialogue})
+        )
 
     return retime_script(
         script.model_copy(update={"scenes": scenes}),

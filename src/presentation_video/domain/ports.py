@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from presentation_video.domain.models import (
     AudioArtifact,
@@ -13,6 +13,7 @@ from presentation_video.domain.models import (
     SlideContent,
     VisualArtifact,
     VisualScenePlan,
+    VideoGeneratorCapabilities,
 )
 
 
@@ -42,6 +43,7 @@ class SpeechSynthesizer(Protocol):
         output_path: Path,
         language: str | None = None,
         style: str | None = None,
+        voice: str | None = None,
     ) -> AudioArtifact: ...
 
 
@@ -68,6 +70,21 @@ class VideoClipGenerator(Protocol):
         image: VisualArtifact,
         output_dir: Path,
         duration_seconds: float,
+    ) -> VisualArtifact: ...
+
+
+@runtime_checkable
+class StoryboardVideoGenerator(Protocol):
+    @property
+    def capabilities(self) -> VideoGeneratorCapabilities: ...
+
+    async def animate_storyboard(
+        self,
+        plans: list[VisualScenePlan],
+        storyboard: VisualArtifact,
+        output_dir: Path,
+        duration_seconds: float,
+        segment_number: int,
     ) -> VisualArtifact: ...
 
 

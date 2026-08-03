@@ -3,8 +3,8 @@ from __future__ import annotations
 import math
 import re
 
+from presentation_video.application.content_audit import assign_information_to_shots
 from presentation_video.domain.models import (
-    MediaMode,
     MotionPreset,
     SceneScript,
     TransitionPreset,
@@ -117,6 +117,8 @@ def compile_shots(
     duration_seconds: float,
     continuity_in: str | None = None,
     maximum_shot_seconds: float = MAX_SHOT_SECONDS,
+    preserve_exact_source_frame: bool = False,
+    exact_information_enabled: bool = True,
 ) -> list[VisualShotPlan]:
     """Compile one narrative scene into grounded, continuous shots of at most eight seconds."""
 
@@ -124,6 +126,7 @@ def compile_shots(
         raise ValueError("maximum shot duration must be between 0 and 8 seconds")
     shot_count = max(1, math.ceil(duration_seconds / maximum_shot_seconds))
     excerpts = _split_semantic_units(script.narration, shot_count)
+    dialogue_directions = _dialogue_directions(script, shot_count)
     action_steps = (
         scene.action_progression
         if len(scene.action_progression) == shot_count
@@ -154,6 +157,7 @@ def compile_shots(
             f"{'; '.join(completed_actions) or 'nothing; this is the first action'}.\n"
             f"REQUIRED END STATE: {next_state}\n"
             f"NARRATION NOW: {excerpts[index]}\n"
+            f"DIALOGUE PERFORMANCE NOW: {dialogue_directions[index]}\n"
             f"SHOT FUNCTION: {story_function}.\n"
             f"VISUAL PROGRESSION: {progression}\n"
             f"REQUIRED CONCEPTS: {', '.join(scene.must_show_concepts) or 'source-grounded action'}.\n"
@@ -194,8 +198,47 @@ def compile_shots(
         )
         cursor = round(cursor + duration, 3)
         previous_state = next_state
+    if exact_information_enabled:
+        shots = assign_information_to_shots(
+            shots,
+            script.critical_information,
+            preserve_source_frame=preserve_exact_source_frame,
+        )
     validate_shots(shots, duration_seconds)
     return shots
+
+
+def _dialogue_directions(script: SceneScript, shot_count: int) -> list[str]:
+    if not script.dialogue:
+        return ["none; this scene uses voice-over narration"] * shot_count
+    total_words = sum(max(len(line.text.split()), 1) for line in script.dialogue)
+    directions: list[str] = []
+    for shot_index in range(shot_count):
+        start = total_words * shot_index / shot_count
+        end = total_words * (shot_index + 1) / shot_count
+        cursor = 0
+        active: list[str] = []
+        for line in script.dialogue:
+            words = line.text.split()
+            line_start = cursor
+            line_end = cursor + max(len(words), 1)
+            overlap_start = max(start, line_start)
+            overlap_end = min(end, line_end)
+            if overlap_end > overlap_start:
+                local_start = max(0, int(overlap_start - line_start))
+                local_end = min(len(words), max(local_start + 1, round(overlap_end - line_start)))
+                excerpt = " ".join(words[local_start:local_end]) or line.text
+                active.append(
+                    f"{line.character_name} speaks with {line.emotion} delivery: {excerpt}"
+                )
+            cursor = line_end
+        directions.append(
+            "; ".join(active)
+            + ". Only the named active speaker moves their mouth naturally; other characters "
+            "listen and react. The final voice track is added separately, so generate no audio "
+            "and invent no additional dialogue."
+        )
+    return directions
 
 
 def validate_shots(shots: list[VisualShotPlan], duration_seconds: float) -> None:
@@ -213,13 +256,17 @@ def validate_shots(shots: list[VisualShotPlan], duration_seconds: float) -> None
             # The compiler contains these words only inside an explicit negative rule.
             if "No slide" not in shot.prompt:
                 raise ValueError("cinematic prompt requests a forbidden source slide")
-        if shot.required_concepts and "REQUIRED CONCEPTS:" not in shot.prompt:
+        if (
+            shot.required_concepts
+            and not shot.locked_static
+            and "REQUIRED CONCEPTS:" not in shot.prompt
+        ):
             raise ValueError("shot prompt omits its required concepts")
-        if "VISUAL PROGRESSION:" not in shot.prompt:
+        if not shot.locked_static and "VISUAL PROGRESSION:" not in shot.prompt:
             raise ValueError("cinematic shot prompt omits its distinct visual progression")
-        if "EXCLUSIVE ACTION NOW:" not in shot.prompt:
+        if not shot.locked_static and "EXCLUSIVE ACTION NOW:" not in shot.prompt:
             raise ValueError("cinematic shot prompt omits its exclusive chronological action")
-        if "ALREADY COMPLETED — NEVER REPEAT:" not in shot.prompt:
+        if not shot.locked_static and "ALREADY COMPLETED — NEVER REPEAT:" not in shot.prompt:
             raise ValueError("cinematic shot prompt omits completed-action continuity")
         cursor += shot.duration_seconds
     if abs(cursor - duration_seconds) > 0.05:
@@ -234,13 +281,14 @@ def materialize_shot(scene: VisualScenePlan, shot: VisualShotPlan) -> VisualScen
             "shot_number": shot.shot_number,
             "prompt": shot.prompt,
             "negative_prompt": shot.negative_prompt,
-            "media_mode": MediaMode.VIDEO,
-            "preserve_source_frame": False,
-            "source_slide_number": None,
+            "media_mode": shot.media_mode,
+            "preserve_source_frame": shot.preserve_source_frame,
+            "source_slide_number": shot.source_slide_number,
             "camera_motion": shot.camera_motion,
             "motion_preset": shot.motion_preset,
             "transition_preset": shot.transition,
             "visual_beats": [],
             "shots": [],
+            "critical_information": shot.critical_information,
         }
     )

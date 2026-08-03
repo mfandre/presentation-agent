@@ -4,10 +4,12 @@ import asyncio
 import logging
 import math
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from presentation_video.domain.models import (
     AudioArtifact,
+    CharacterReferenceArtifact,
     JobStatus,
     MediaMode,
     MotionPreset,
@@ -18,9 +20,12 @@ from presentation_video.domain.models import (
     SlideContent,
     VideoJobRequest,
     VideoJobResult,
+    VideoGeneratorCapabilities,
     VisualArtifact,
+    VisualScenePlan,
     VisualBeat,
     VisualBeatKind,
+    StoryboardBundle,
     build_default_visual_beats,
 )
 from presentation_video.domain.errors import DurationReviewRequired
@@ -33,10 +38,25 @@ from presentation_video.domain.ports import (
     SpeechSynthesizer,
     VideoAssembler,
     VideoClipGenerator,
+    StoryboardVideoGenerator,
     VisualAssetGenerator,
     VisualPlanner,
 )
 from presentation_video.application.cinematic import compile_shots, materialize_shot
+from presentation_video.application.dialogue import (
+    DEFAULT_DIALOGUE_VOICES,
+    build_character_voice_map,
+    synthesize_scene_audio,
+    uses_character_dialogue,
+)
+from presentation_video.application.content_audit import (
+    attach_critical_information,
+    audit_critical_information,
+    critical_information_summary,
+    validate_critical_information_coverage,
+    validate_visual_critical_information_coverage,
+)
+from presentation_video.application.information_cards import render_information_card
 from presentation_video.application.brand import apply_brand_images, apply_brand_kit
 from presentation_video.application.captions import build_caption_cues, write_caption_files
 from presentation_video.application.audio_cache import valid_wav_duration as _valid_wav_duration
@@ -66,6 +86,11 @@ from presentation_video.application.visual_checkpoints import (
     select_source_slide,
 )
 from presentation_video.application.whiteboard import compile_whiteboard_shots
+from presentation_video.application.storyboard import (
+    build_segment_storyboard,
+    generate_character_references,
+    generate_storyboard_bundle,
+)
 from presentation_video.application.whiteboard_states import (
     build_progressive_whiteboard_states,
 )
@@ -82,6 +107,46 @@ from presentation_video.infrastructure.video import (
 from presentation_video.infrastructure.visual_planning import validate_sequence
 
 logger = logging.getLogger(__name__)
+
+
+def _storyboard_animation_input(
+    image: VisualArtifact,
+    next_image: VisualArtifact | None,
+    *,
+    storyboard_present: bool,
+    supports_last_frame: bool,
+) -> VisualArtifact:
+    if (
+        not storyboard_present
+        or not supports_last_frame
+        or next_image is None
+        or next_image.source_slide_number is not None
+        or next_image.locked_static
+    ):
+        return image
+    return image.model_copy(update={"start_path": image.path, "path": next_image.path})
+
+
+def _model_adjusted_take_seconds(
+    generator: VideoClipGenerator,
+    target_seconds: float,
+    maximum_shot_seconds: float,
+) -> float:
+    capabilities = getattr(generator, "capabilities", VideoGeneratorCapabilities())
+    available_maximum = min(
+        capabilities.maximum_output_seconds,
+        maximum_shot_seconds,
+    )
+    if available_maximum < capabilities.minimum_output_seconds:
+        raise ValueError(
+            "maximum shot duration is shorter than the selected model minimum "
+            f"({available_maximum:.1f}s < {capabilities.minimum_output_seconds:.1f}s)"
+        )
+    return min(
+        max(target_seconds, capabilities.minimum_output_seconds),
+        available_maximum,
+    )
+
 
 class CreatePresentationVideo:
     """Two-phase use case: prepare reviewable images, then animate approved images."""
@@ -100,20 +165,36 @@ class CreatePresentationVideo:
         reporter: JobReporter,
         work_root: Path,
         output_root: Path,
+        whiteboard_video_clip_generator: VideoClipGenerator | None = None,
+        whiteboard_video_clip_generator_factory: Callable[[], VideoClipGenerator] | None = None,
         max_parallel_scenes: int = 3,
         max_parallel_images: int | None = None,
         max_parallel_speech: int | None = None,
         max_parallel_animations: int | None = None,
+        whiteboard_max_parallel_animations: int | None = None,
         max_parallel_renders: int | None = None,
         maximum_shot_seconds: float = 8,
         duration_tolerance_percent: float = 5,
         words_per_minute: int = 155,
+        storyboard_enabled: bool = False,
+        storyboard_panel_seconds: float = 3,
+        storyboard_panels_per_sheet: int = 9,
+        whiteboard_target_take_seconds: float = 2,
+        dialogue_voices: tuple[str, ...] = DEFAULT_DIALOGUE_VOICES,
+        critical_information_signals: tuple[str, ...] = (
+            "approval_matrix",
+            "deadlines",
+            "exact_numbers",
+            "tables",
+        ),
     ) -> None:
         self._ingestor_factory = ingestor_factory
         self._narrative_generator = narrative_generator
         self._visual_planner = visual_planner
         self._visual_asset_generator = visual_asset_generator
         self._video_clip_generator = video_clip_generator
+        self._whiteboard_video_clip_generator = whiteboard_video_clip_generator
+        self._whiteboard_video_clip_generator_factory = whiteboard_video_clip_generator_factory
         self._speech_synthesizer = speech_synthesizer
         self._avatar_renderer = avatar_renderer
         self._scene_renderer = scene_renderer
@@ -132,12 +213,36 @@ class CreatePresentationVideo:
         self._animation_semaphore = asyncio.Semaphore(
             max_parallel_animations or max_parallel_scenes
         )
+        self._whiteboard_animation_semaphore = asyncio.Semaphore(
+            whiteboard_max_parallel_animations
+            or max_parallel_animations
+            or max_parallel_scenes
+        )
         self._render_semaphore = asyncio.Semaphore(
             max_parallel_renders or max_parallel_scenes
         )
         self._maximum_shot_seconds = maximum_shot_seconds
         self._duration_tolerance_percent = duration_tolerance_percent
         self._words_per_minute = words_per_minute
+        self._storyboard_enabled = storyboard_enabled
+        self._storyboard_panel_seconds = min(
+            max(storyboard_panel_seconds, 1.0), maximum_shot_seconds
+        )
+        self._storyboard_panels_per_sheet = storyboard_panels_per_sheet
+        if whiteboard_target_take_seconds <= 0:
+            raise ValueError("whiteboard target take duration must be positive")
+        self._whiteboard_target_take_seconds = whiteboard_target_take_seconds
+        self._dialogue_voices = dialogue_voices
+        self._critical_information_signals = critical_information_signals
+
+    def _whiteboard_generator(self) -> VideoClipGenerator:
+        if self._whiteboard_video_clip_generator is None:
+            self._whiteboard_video_clip_generator = (
+                self._whiteboard_video_clip_generator_factory()
+                if self._whiteboard_video_clip_generator_factory is not None
+                else self._video_clip_generator
+            )
+        return self._whiteboard_video_clip_generator
 
     async def restore(self, request: VideoJobRequest, job_id: str) -> PreparedVideoJob:
         return await restore_prepared_job(
@@ -168,6 +273,27 @@ class CreatePresentationVideo:
                 request.source_path, work_dir
             )
             source_page_count = len(document.slides)
+            critical_information = audit_critical_information(
+                document,
+                self._critical_information_signals,
+            )
+            document = document.model_copy(
+                update={"critical_information": critical_information}
+            )
+            content_audit_path = output_dir / "content-audit.json"
+            content_audit_path.write_text(
+                "[\n"
+                + ",\n".join(
+                    unit.model_dump_json(indent=2) for unit in critical_information
+                )
+                + "\n]",
+                encoding="utf-8",
+            )
+            await self._reporter.update(
+                job_id,
+                JobStatus.INGESTING,
+                f"Informações críticas identificadas: {len(critical_information)}",
+            )
 
             script_path = output_dir / "script.json"
             if duration_decision and script_path.is_file():
@@ -191,10 +317,23 @@ class CreatePresentationVideo:
                     target_seconds=request.target_seconds,
                     language=request.language,
                     audience=request.audience,
-                    tone=direct_narrative_tone(request.production_mode, request.tone),
+                    tone=direct_narrative_tone(
+                        request.production_mode,
+                        request.tone,
+                        request.preset_options,
+                    ),
                 )
                 script = transform_script(request.production_mode, script)
+            if request.production_mode != ProductionMode.CINEMATIC_STORY:
+                script = attach_critical_information(script, critical_information)
+                validate_critical_information_coverage(script, critical_information)
             script_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
+            logger.info(
+                "job=%s critical information coverage validated units=%s details=%s",
+                job_id,
+                len(critical_information),
+                critical_information_summary(critical_information),
+            )
             await self._reporter.update(
                 job_id,
                 JobStatus.DURATION_VALIDATING,
@@ -219,6 +358,14 @@ class CreatePresentationVideo:
                 script = _retime_script(script, estimated_seconds)
                 script_path.write_text(script.model_dump_json(indent=2), encoding="utf-8")
             total_scenes = len(script.scenes)
+            dialogue_mode = uses_character_dialogue(
+                request.production_mode,
+                request.preset_options,
+            )
+            dialogue_voice_map = build_character_voice_map(
+                script,
+                self._dialogue_voices,
+            ) if dialogue_mode else {}
             aligned_audio_durations: dict[int, float] = {}
             aligned_audio: dict[int, AudioArtifact] = {}
             await self._reporter.update(
@@ -230,11 +377,15 @@ class CreatePresentationVideo:
                 audio_path = work_dir / "audio" / f"scene-{scene.scene_number:03d}.wav"
                 duration = _valid_wav_duration(audio_path)
                 if duration is None:
-                    audio = await self._speech_synthesizer.synthesize(
-                        scene.narration,
+                    audio = await synthesize_scene_audio(
+                        scene,
                         audio_path,
+                        self._speech_synthesizer,
                         language=request.language,
                         style=request.tone,
+                        dialogue_mode=dialogue_mode,
+                        voices=self._dialogue_voices,
+                        voice_map=dialogue_voice_map,
                     )
                     duration = audio.duration_seconds
                 else:
@@ -288,10 +439,14 @@ class CreatePresentationVideo:
                     ]
                 }
             )
+            requires_exact_hybrid_shots = (
+                request.production_mode == ProductionMode.HYBRID_PRESENTATION
+                and any(scene.critical_information for scene in script.scenes)
+            )
             if request.production_mode in {
                 ProductionMode.CINEMATIC_STORY,
                 ProductionMode.CORPORATE_TRAINING,
-            }:
+            } or requires_exact_hybrid_shots:
                 scripts_by_number = {item.scene_number: item for item in script.scenes}
                 compiled_scenes = []
                 continuity = "open the film in the visual world defined by creative direction"
@@ -299,17 +454,34 @@ class CreatePresentationVideo:
                     if visual_scene.media_mode == MediaMode.STATIC:
                         compiled_scenes.append(visual_scene.model_copy(update={"shots": []}))
                         continue
+                    shot_seconds = (
+                        self._storyboard_panel_seconds
+                        if request.production_mode == ProductionMode.CINEMATIC_STORY
+                        and self._storyboard_enabled
+                        else self._maximum_shot_seconds
+                    )
                     shots = compile_shots(
                         visual_scene,
                         scripts_by_number[visual_scene.scene_number],
                         aligned_audio_durations[visual_scene.scene_number],
                         continuity_in=continuity,
-                        maximum_shot_seconds=self._maximum_shot_seconds,
+                        maximum_shot_seconds=shot_seconds,
+                        preserve_exact_source_frame=(
+                            request.production_mode == ProductionMode.HYBRID_PRESENTATION
+                        ),
+                        exact_information_enabled=(
+                            request.production_mode != ProductionMode.CINEMATIC_STORY
+                        ),
                     )
                     continuity = shots[-1].continuity_out
                     compiled_scenes.append(visual_scene.model_copy(update={"shots": shots}))
                 visual_plan = visual_plan.model_copy(update={"scenes": compiled_scenes})
             elif request.production_mode == ProductionMode.WHITEBOARD_EXPLAINER:
+                whiteboard_take_seconds = _model_adjusted_take_seconds(
+                    self._whiteboard_generator(),
+                    self._whiteboard_target_take_seconds,
+                    self._maximum_shot_seconds,
+                )
                 scripts_by_number = {item.scene_number: item for item in script.scenes}
                 compiled_scenes = []
                 continuity = "an empty pure-white board"
@@ -319,12 +491,14 @@ class CreatePresentationVideo:
                         scripts_by_number[visual_scene.scene_number],
                         aligned_audio_durations[visual_scene.scene_number],
                         continuity_in=continuity,
-                        maximum_shot_seconds=self._maximum_shot_seconds,
+                        maximum_shot_seconds=whiteboard_take_seconds,
                     )
                     continuity = shots[-1].continuity_out
                     compiled_scenes.append(visual_scene.model_copy(update={"shots": shots}))
                 visual_plan = visual_plan.model_copy(update={"scenes": compiled_scenes})
             validate_preset_plan(request.production_mode, visual_plan)
+            if request.production_mode != ProductionMode.CINEMATIC_STORY:
+                validate_visual_critical_information_coverage(visual_plan, script)
             await self._reporter.update(
                 job_id,
                 JobStatus.PROMPT_COMPILING,
@@ -401,7 +575,26 @@ class CreatePresentationVideo:
                         if scene_plan.shots
                         else scene_plan
                     )
-                    if plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
+                    if (
+                        plan.media_mode == MediaMode.STATIC
+                        and plan.critical_information
+                        and not plan.preserve_source_frame
+                    ):
+                        image = await asyncio.to_thread(
+                            render_information_card,
+                            plan.critical_information,
+                            work_dir
+                            / "images"
+                            / (
+                                f"scene-{scene_number:03d}-shot-{shot_number:03d}"
+                                "-exact-r1.png"
+                            ),
+                            scene_number=scene_number,
+                            shot_number=shot_number,
+                            production_mode=request.production_mode,
+                            brand=request.brand_kit,
+                        )
+                    elif plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
                         selected_number = plan.source_slide_number or scene_sources[0].number
                         selected_slide = source_slides[selected_number]
                         image = VisualArtifact(
@@ -448,6 +641,8 @@ class CreatePresentationVideo:
                 for scene in visual_plan.scenes
                 for shot in _shots_or_default(scene.shots)
             ]
+            character_references: list[CharacterReferenceArtifact] = []
+            storyboard_bundle: StoryboardBundle | None = None
             if request.production_mode == ProductionMode.WHITEBOARD_EXPLAINER:
                 async def generate_whiteboard_scene(
                     scene_number: int,
@@ -481,6 +676,26 @@ class CreatePresentationVideo:
                             len(scene_plan.shots),
                             work_dir / "images",
                         )
+                        exact_shots = {
+                            shot.shot_number: shot
+                            for shot in scene_plan.shots
+                            if shot.locked_static and shot.critical_information
+                        }
+                        for shot_number, shot in exact_shots.items():
+                            states[shot_number - 1] = await asyncio.to_thread(
+                                render_information_card,
+                                shot.critical_information,
+                                work_dir
+                                / "images"
+                                / (
+                                    f"scene-{scene_number:03d}-shot-{shot_number:03d}"
+                                    "-exact-r1.png"
+                                ),
+                                scene_number=scene_number,
+                                shot_number=shot_number,
+                                production_mode=request.production_mode,
+                                brand=request.brand_kit,
+                            )
                         completed_images += len(states)
                         await self._reporter.update(
                             job_id,
@@ -499,40 +714,48 @@ class CreatePresentationVideo:
                     )
                 )
                 images = [image for group in state_groups for image in group]
+            elif (
+                request.production_mode == ProductionMode.CINEMATIC_STORY
+                and self._storyboard_enabled
+            ):
+                await self._reporter.update(
+                    job_id,
+                    JobStatus.DESIGNING_CHARACTERS,
+                    "Criando folhas canônicas dos personagens recorrentes",
+                )
+                character_references = await generate_character_references(
+                    visual_plan,
+                    self._visual_asset_generator,
+                    work_dir / "character-references",
+                    self._image_semaphore,
+                )
+                await self._reporter.update(
+                    job_id,
+                    JobStatus.STORYBOARDING,
+                    f"completed=0 total={len(image_tasks)} | criando storyboard cinematográfico",
+                )
+                storyboard_bundle, images = await generate_storyboard_bundle(
+                    visual_plan,
+                    script,
+                    character_references,
+                    self._visual_asset_generator,
+                    work_dir / "storyboard",
+                    self._image_semaphore,
+                    panels_per_sheet=self._storyboard_panels_per_sheet,
+                )
+                await self._reporter.update(
+                    job_id,
+                    JobStatus.STORYBOARDING,
+                    f"completed={len(images)} total={len(image_tasks)} | storyboard e recortes "
+                    "de fallback preparados",
+                )
             else:
-                if request.production_mode == ProductionMode.CINEMATIC_STORY:
-                    # A generated identity reference is more effective than prose alone. Generate
-                    # cinematic frames in story order and pass the preceding approved frame into
-                    # the next request so recurring people are not independently recast.
-                    images = []
-                    character_references: dict[str, Path] = {}
-                    for scene_number, shot_number in image_tasks:
-                        character_ids = plans[scene_number].recurring_character_ids
-                        identity_reference = next(
-                            (
-                                character_references[character_id]
-                                for character_id in character_ids
-                                if character_id in character_references
-                            ),
-                            None,
-                        )
-                        image = await generate_image(
-                            scene_number,
-                            shot_number,
-                            identity_reference=identity_reference,
-                        )
-                        images.append(image)
-                        for character_id in character_ids:
-                            # Keep one canonical identity anchor. Chaining every generated frame
-                            # causes pose, framing, and scenery to drift into the next take.
-                            character_references.setdefault(character_id, image.path)
-                else:
-                    images = await asyncio.gather(
-                        *(
-                            generate_image(scene_number, shot_number)
-                            for scene_number, shot_number in image_tasks
-                        )
+                images = await asyncio.gather(
+                    *(
+                        generate_image(scene_number, shot_number)
+                        for scene_number, shot_number in image_tasks
                     )
+                )
             images = apply_brand_images(images, request.brand_kit)
             prepared = PreparedVideoJob(
                 job_id=job_id,
@@ -541,6 +764,8 @@ class CreatePresentationVideo:
                 script=script,
                 visual_plan=visual_plan,
                 visual_images=images,
+                character_references=character_references,
+                storyboard=storyboard_bundle,
                 aligned_audio=aligned_audio,
                 work_dir=work_dir,
                 output_dir=output_dir,
@@ -620,6 +845,14 @@ class CreatePresentationVideo:
         total_scenes = len(prepared.script.scenes)
         source_slides = {slide.number: slide for slide in prepared.document.slides}
         scripts = {item.scene_number: item for item in prepared.script.scenes}
+        dialogue_mode = uses_character_dialogue(
+            prepared.request.production_mode,
+            prepared.request.preset_options,
+        )
+        dialogue_voice_map = build_character_voice_map(
+            prepared.script,
+            self._dialogue_voices,
+        ) if dialogue_mode else {}
         plans = {item.scene_number: item for item in prepared.visual_plan.scenes}
         for scene_number, plan in plans.items():
             if not plan.visual_beats and not plan.shots:
@@ -637,6 +870,16 @@ class CreatePresentationVideo:
                     ),
                 )
         images = {(item.scene_number, item.shot_number): item for item in prepared.visual_images}
+        video_clip_generator = (
+            self._whiteboard_generator()
+            if prepared.request.production_mode == ProductionMode.WHITEBOARD_EXPLAINER
+            else self._video_clip_generator
+        )
+        animation_semaphore = (
+            self._whiteboard_animation_semaphore
+            if prepared.request.production_mode == ProductionMode.WHITEBOARD_EXPLAINER
+            else self._animation_semaphore
+        )
         try:
             logger.info("job=%s finalization started approved_images=%s", job_id, len(images))
             completed_audio = 0
@@ -651,11 +894,15 @@ class CreatePresentationVideo:
                     if cached_audio is not None:
                         audio = cached_audio
                     elif duration is None:
-                        audio = await self._speech_synthesizer.synthesize(
-                            scripts[scene_number].narration,
+                        audio = await synthesize_scene_audio(
+                            scripts[scene_number],
                             audio_path,
+                            self._speech_synthesizer,
                             language=prepared.request.language,
                             style=prepared.request.tone,
+                            dialogue_mode=dialogue_mode,
+                            voices=self._dialogue_voices,
+                            voice_map=dialogue_voice_map,
                         )
                     else:
                         audio = AudioArtifact(path=audio_path, duration_seconds=duration)
@@ -700,10 +947,36 @@ class CreatePresentationVideo:
                 for shot in _shots_or_default(scene.shots)
             ]
             total_shots = len(shot_tasks)
+            video_capabilities = getattr(
+                video_clip_generator,
+                "capabilities",
+                VideoGeneratorCapabilities(),
+            )
+
+            storyboard_video_generator = (
+                video_clip_generator
+                if prepared.storyboard is not None
+                and isinstance(video_clip_generator, StoryboardVideoGenerator)
+                and video_clip_generator.capabilities.supports_storyboard_reference
+                and video_clip_generator.capabilities.supports_multishot
+                else None
+            )
+            direct_storyboard_enabled = storyboard_video_generator is not None and all(
+                plans[scene_number].media_mode == MediaMode.VIDEO
+                and bool(plans[scene_number].shots)
+                and images[(scene_number, shot_number)].source_slide_number is None
+                and not images[(scene_number, shot_number)].locked_static
+                and (
+                    not plans[scene_number].shots
+                    or plans[scene_number].shots[shot_number - 1].duration_seconds
+                    <= storyboard_video_generator.capabilities.maximum_output_seconds
+                )
+                for scene_number, shot_number in shot_tasks
+            )
 
             async def animate(scene_number: int, shot_number: int) -> VisualArtifact:
                 nonlocal completed_clips
-                async with self._animation_semaphore:
+                async with animation_semaphore:
                     scene_plan = plans[scene_number]
                     shot = scene_plan.shots[shot_number - 1] if scene_plan.shots else None
                     plan = materialize_shot(scene_plan, shot) if shot else scene_plan
@@ -725,11 +998,20 @@ class CreatePresentationVideo:
                         if shot_number > 1:
                             stem += f"-shot-{shot_number:03d}"
                         cached_clip = prepared.work_dir / "clips" / f"{stem}.mp4"
-                        source_image = image.path
+                        animation_image = _storyboard_animation_input(
+                            image,
+                            images.get((scene_number, shot_number + 1)),
+                            storyboard_present=prepared.storyboard is not None,
+                            supports_last_frame=video_capabilities.supports_last_frame,
+                        )
+                        source_paths = [animation_image.path]
+                        if animation_image.start_path is not None:
+                            source_paths.append(animation_image.start_path)
+                        newest_source_mtime = max(path.stat().st_mtime for path in source_paths)
                         cache_is_current = (
                             cached_clip.is_file()
                             and cached_clip.stat().st_size > 0
-                            and cached_clip.stat().st_mtime >= source_image.stat().st_mtime
+                            and cached_clip.stat().st_mtime >= newest_source_mtime
                         )
                         if cache_is_current:
                             clip = VisualArtifact(
@@ -759,9 +1041,9 @@ class CreatePresentationVideo:
                                 if shot
                                 else audio_by_scene[scene_number][0].duration_seconds
                             )
-                            clip = await self._video_clip_generator.animate(
+                            clip = await video_clip_generator.animate(
                                 plan,
-                                image,
+                                animation_image,
                                 prepared.work_dir / "clips",
                                 duration_seconds=target_duration,
                             )
@@ -788,26 +1070,158 @@ class CreatePresentationVideo:
                     )
                     return clip
 
-            clips = await asyncio.gather(
-                *(animate(scene_number, shot_number) for scene_number, shot_number in shot_tasks)
-            )
-            clips_by_key = {(clip.scene_number, clip.shot_number): clip for clip in clips}
             clips_by_scene: dict[int, VisualArtifact] = {}
-            for scene_number, plan in plans.items():
-                if plan.shots:
+            if direct_storyboard_enabled:
+                assert storyboard_video_generator is not None
+                capabilities = storyboard_video_generator.capabilities
+                segment_specs: list[
+                    tuple[int, int, list[VisualScenePlan], list[VisualArtifact], float]
+                ] = []
+                for scene_number, scene_plan in plans.items():
+                    current_plans: list[VisualScenePlan] = []
+                    current_images: list[VisualArtifact] = []
+                    current_duration = 0.0
+                    segment_number = 1
+                    for shot in scene_plan.shots:
+                        duration = shot.duration_seconds
+                        if (
+                            current_plans
+                            and current_duration + duration
+                            > capabilities.maximum_output_seconds
+                        ):
+                            segment_specs.append(
+                                (
+                                    scene_number,
+                                    segment_number,
+                                    current_plans,
+                                    current_images,
+                                    current_duration,
+                                )
+                            )
+                            segment_number += 1
+                            current_plans = []
+                            current_images = []
+                            current_duration = 0.0
+                        current_plans.append(
+                            materialize_shot(scene_plan, shot).model_copy(
+                                update={"emphasis_beats_seconds": [duration]}
+                            )
+                        )
+                        current_images.append(images[(scene_number, shot.shot_number)])
+                        current_duration += duration
+                    if current_plans:
+                        segment_specs.append(
+                            (
+                                scene_number,
+                                segment_number,
+                                current_plans,
+                                current_images,
+                                current_duration,
+                            )
+                        )
+
+                total_segments = len(segment_specs)
+
+                async def animate_storyboard_segment(
+                    scene_number: int,
+                    segment_number: int,
+                    segment_plans: list[VisualScenePlan],
+                    segment_images: list[VisualArtifact],
+                    segment_duration: float,
+                ) -> tuple[int, int, float, VisualArtifact]:
+                    nonlocal completed_clips
+                    async with animation_semaphore:
+                        segment_path = (
+                            prepared.work_dir
+                            / "storyboard"
+                            / "segments"
+                            / f"scene-{scene_number:03d}-segment-{segment_number:03d}.jpg"
+                        )
+                        storyboard_image = await asyncio.to_thread(
+                            build_segment_storyboard,
+                            segment_images,
+                            segment_path,
+                        )
+                        cached_clip = (
+                            prepared.work_dir
+                            / "clips"
+                            / f"scene-{scene_number:03d}-storyboard-segment-"
+                            f"{segment_number:03d}.mp4"
+                        )
+                        newest_input = max(
+                            [storyboard_image.path.stat().st_mtime]
+                            + [image.path.stat().st_mtime for image in segment_images]
+                        )
+                        if (
+                            cached_clip.is_file()
+                            and cached_clip.stat().st_size > 0
+                            and cached_clip.stat().st_mtime >= newest_input
+                        ):
+                            clip = VisualArtifact(
+                                scene_number=scene_number,
+                                shot_number=segment_images[0].shot_number,
+                                path=cached_clip,
+                                kind="video",
+                                revision=max(image.revision for image in segment_images),
+                            )
+                        else:
+                            clip = await storyboard_video_generator.animate_storyboard(
+                                segment_plans,
+                                storyboard_image,
+                                prepared.work_dir / "clips",
+                                segment_duration,
+                                segment_number,
+                            )
+                        completed_clips += 1
+                        await self._reporter.update(
+                            job_id,
+                            JobStatus.GENERATING_VIDEO,
+                            f"completed={completed_clips} total={total_segments} | bloco "
+                            f"multi-shot {segment_number} da cena {scene_number} concluído",
+                        )
+                        return scene_number, segment_number, segment_duration, clip
+
+                segment_results = await asyncio.gather(
+                    *(
+                        animate_storyboard_segment(*spec)
+                        for spec in segment_specs
+                    )
+                )
+                clips = [result[3] for result in segment_results]
+                for scene_number in plans:
+                    scene_segments = sorted(
+                        (
+                            (segment_number, duration, clip)
+                            for result_scene, segment_number, duration, clip in segment_results
+                            if result_scene == scene_number
+                        ),
+                        key=lambda item: item[0],
+                    )
                     clips_by_scene[scene_number] = await _compose_shot_clips(
                         scene_number,
-                        [
-                            (
-                                clips_by_key[(scene_number, shot.shot_number)],
-                                shot.duration_seconds,
-                            )
-                            for shot in plan.shots
-                        ],
+                        [(clip, duration) for _, duration, clip in scene_segments],
                         prepared.work_dir / "clips" / f"scene-{scene_number:03d}-sequence.mp4",
                     )
-                else:
-                    clips_by_scene[scene_number] = clips_by_key[(scene_number, 1)]
+            else:
+                clips = await asyncio.gather(
+                    *(animate(scene_number, shot_number) for scene_number, shot_number in shot_tasks)
+                )
+                clips_by_key = {(clip.scene_number, clip.shot_number): clip for clip in clips}
+                for scene_number, plan in plans.items():
+                    if plan.shots:
+                        clips_by_scene[scene_number] = await _compose_shot_clips(
+                            scene_number,
+                            [
+                                (
+                                    clips_by_key[(scene_number, shot.shot_number)],
+                                    shot.duration_seconds,
+                                )
+                                for shot in plan.shots
+                            ],
+                            prepared.work_dir / "clips" / f"scene-{scene_number:03d}-sequence.mp4",
+                        )
+                    else:
+                        clips_by_scene[scene_number] = clips_by_key[(scene_number, 1)]
 
             await self._reporter.update(
                 job_id,

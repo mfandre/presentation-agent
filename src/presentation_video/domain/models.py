@@ -17,6 +17,8 @@ class JobStatus(StrEnum):
     VISUAL_PLANNING = "visual_planning"
     PROMPT_COMPILING = "prompt_compiling"
     RULE_VALIDATING = "rule_validating"
+    DESIGNING_CHARACTERS = "designing_characters"
+    STORYBOARDING = "storyboarding"
     GENERATING_IMAGES = "generating_images"
     AWAITING_VISUAL_APPROVAL = "awaiting_visual_approval"
     GENERATING_VIDEO = "generating_video"
@@ -86,6 +88,26 @@ class InstructionalContentType(StrEnum):
     RECAP = "recap"
 
 
+class CriticalInformationKind(StrEnum):
+    APPROVAL_MATRIX = "approval_matrix"
+    DEADLINE = "deadline"
+    EXACT_NUMBERS = "exact_numbers"
+    TABLE = "table"
+    RULE = "rule"
+
+
+class CriticalInformationUnit(BaseModel):
+    id: str = Field(min_length=1, max_length=120, pattern=r"^[a-z0-9_-]+$")
+    kind: CriticalInformationKind
+    title: str = Field(min_length=1, max_length=180)
+    source_slide_numbers: list[int] = Field(min_length=1)
+    facts: list[str] = Field(min_length=1, max_length=12)
+    keywords: list[str] = Field(default_factory=list, max_length=20)
+    priority: int = Field(default=3, ge=1, le=5)
+    exact_display_required: bool = False
+    mandatory: bool = False
+
+
 class MotionPreset(StrEnum):
     NONE = "none"
     SLOW_PUSH = "slow_push"
@@ -107,6 +129,12 @@ class VisualBeatKind(StrEnum):
     GENERATED_IMAGE = "generated_image"
     SOURCE_SLIDE = "source_slide"
     MOTION_GRAPHIC = "motion_graphic"
+
+
+class VisualGenerationPurpose(StrEnum):
+    SCENE_FRAME = "scene_frame"
+    CHARACTER_REFERENCE = "character_reference"
+    STORYBOARD = "storyboard"
 
 
 class VisualBeat(BaseModel):
@@ -131,6 +159,11 @@ class VisualShotPlan(BaseModel):
     motion_preset: MotionPreset = MotionPreset.SLOW_PUSH
     transition: TransitionPreset = TransitionPreset.CUT
     required_concepts: list[str] = Field(default_factory=list)
+    media_mode: MediaMode = MediaMode.VIDEO
+    source_slide_number: int | None = Field(default=None, ge=1)
+    preserve_source_frame: bool = False
+    locked_static: bool = False
+    critical_information: list[CriticalInformationUnit] = Field(default_factory=list)
 
 
 def build_default_visual_beats(
@@ -234,12 +267,21 @@ class PresentationDocument(BaseModel):
     source_path: Path
     title: str = ""
     slides: list[SlideContent] = Field(min_length=1)
+    critical_information: list[CriticalInformationUnit] = Field(default_factory=list)
+
+
+class DialogueLine(BaseModel):
+    character_id: str = Field(min_length=1, max_length=60, pattern=r"^[a-z0-9_-]+$")
+    character_name: str = Field(min_length=1, max_length=80)
+    text: str = Field(min_length=1, max_length=1200)
+    emotion: str = Field(default="natural", min_length=1, max_length=80)
 
 
 class SceneScript(BaseModel):
     scene_number: int = Field(ge=1)
     source_slide_numbers: list[int] = Field(min_length=1)
     narration: str = Field(min_length=1)
+    dialogue: list[DialogueLine] = Field(default_factory=list, max_length=20)
     target_seconds: int = Field(ge=1, le=1800)
     short_caption: str = Field(default="", max_length=160)
     media_mode: MediaMode = MediaMode.STATIC
@@ -249,6 +291,7 @@ class SceneScript(BaseModel):
     scene_purpose: str = Field(default="", max_length=300)
     relationship_to_thesis: str = Field(default="", max_length=400)
     narrative_progress: str = Field(default="", max_length=300)
+    critical_information: list[CriticalInformationUnit] = Field(default_factory=list)
 
 
 class PresentationScript(BaseModel):
@@ -270,6 +313,7 @@ class PresentationScript(BaseModel):
 class VisualScenePlan(BaseModel):
     scene_number: int = Field(ge=1)
     shot_number: int = Field(default=1, ge=1)
+    generation_purpose: VisualGenerationPurpose = VisualGenerationPurpose.SCENE_FRAME
     content_language: str = Field(default="und", min_length=2, max_length=35)
     instructional_type: InstructionalContentType | None = None
     learning_objective: str = Field(default="", max_length=400)
@@ -308,6 +352,7 @@ class VisualScenePlan(BaseModel):
         "operational evidence, natural materials and lighting, source-grounded"
     )
     shots: list[VisualShotPlan] = Field(default_factory=list)
+    critical_information: list[CriticalInformationUnit] = Field(default_factory=list)
 
 
 class PresentationVisualPlan(BaseModel):
@@ -324,6 +369,55 @@ class VisualArtifact(BaseModel):
     revision: int = Field(default=1, ge=1)
     source_slide_number: int | None = Field(default=None, ge=1)
     locked_static: bool = False
+
+
+class CharacterReferenceArtifact(BaseModel):
+    character_id: str = Field(min_length=1, max_length=60, pattern=r"^[a-z0-9_-]+$")
+    path: Path
+    prompt: str = Field(min_length=1)
+    revision: int = Field(default=1, ge=1)
+
+
+class StoryboardPanel(BaseModel):
+    panel_number: int = Field(ge=1)
+    scene_number: int = Field(ge=1)
+    shot_number: int = Field(ge=1)
+    sheet_number: int = Field(ge=1)
+    cell_number: int = Field(ge=1)
+    start_seconds: float = Field(ge=0)
+    duration_seconds: float = Field(gt=0)
+    camera: str = ""
+    action: str = ""
+    emotional_focus: str = ""
+    continuity_in: str = ""
+    continuity_out: str = ""
+    character_ids: list[str] = Field(default_factory=list)
+    image_path: Path | None = None
+
+
+class StoryboardSheet(BaseModel):
+    sheet_number: int = Field(ge=1)
+    clean_path: Path
+    review_path: Path
+    rows: int = Field(ge=1, le=4)
+    columns: int = Field(ge=1, le=4)
+    panel_numbers: list[int] = Field(min_length=1)
+
+
+class StoryboardBundle(BaseModel):
+    panels: list[StoryboardPanel] = Field(min_length=1)
+    sheets: list[StoryboardSheet] = Field(min_length=1)
+    plan_path: Path
+
+
+class VideoGeneratorCapabilities(BaseModel):
+    supports_storyboard_reference: bool = False
+    supports_multishot: bool = False
+    minimum_output_seconds: float = Field(default=1, gt=0)
+    maximum_output_seconds: float = Field(default=8, gt=0)
+    maximum_reference_images: int = Field(default=1, ge=1)
+    supports_first_frame: bool = True
+    supports_last_frame: bool = False
 
 
 class AudioArtifact(BaseModel):
@@ -356,6 +450,8 @@ class PreparedVideoJob(BaseModel):
     script: PresentationScript
     visual_plan: PresentationVisualPlan
     visual_images: list[VisualArtifact]
+    character_references: list[CharacterReferenceArtifact] = Field(default_factory=list)
+    storyboard: StoryboardBundle | None = None
     aligned_audio: dict[int, AudioArtifact] = Field(default_factory=dict)
     work_dir: Path
     output_dir: Path

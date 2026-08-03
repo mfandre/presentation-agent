@@ -1,13 +1,94 @@
 from presentation_video.application.cinematic import compile_shots, validate_shots
 from presentation_video.application.pipeline import _cinematic_visual_plan
+from presentation_video.application.production_presets import (
+    get_production_preset,
+    transform_visual_plan,
+)
 from presentation_video.domain.models import (
     CharacterProfile,
     CreativeDirection,
     MediaMode,
     PresentationVisualPlan,
+    ProductionMode,
     SceneScript,
     VisualScenePlan,
 )
+
+
+def test_cinematic_preset_exposes_requested_visual_styles_with_current_default() -> None:
+    preset = get_production_preset(ProductionMode.CINEMATIC_STORY)
+    option = next(item for item in preset.options if item.id == "visual_style")
+
+    assert option.default == "default"
+    assert [(choice.value, choice.label) for choice in option.choices] == [
+        ("default", "Default — realistic editorial documentary"),
+        ("disney_animation", "Disney animation"),
+        ("pixar_style_3d", "Pixar-style 3D"),
+        ("anime", "Anime"),
+        ("live_action", "Live action"),
+        ("stylized_3d", "Stylized 3D"),
+        ("comic_book", "Comic book"),
+        ("fantasy", "Fantasy"),
+        ("sci_fi", "Sci-fi"),
+        ("horror", "Horror"),
+        ("stop_motion", "Stop motion"),
+    ]
+
+
+def test_cinematic_visual_style_is_locked_across_direction_and_scenes() -> None:
+    original_style = "realistic documentary photography"
+    plan = PresentationVisualPlan(
+        creative_direction=CreativeDirection(visual_motif="an inherited visual motif"),
+        scenes=[
+            VisualScenePlan(
+                scene_number=1,
+                prompt="A fisher prepares a boat at dawn.",
+                media_mode=MediaMode.VIDEO,
+                preserve_source_frame=False,
+                visual_style=original_style,
+            )
+        ],
+    )
+    plan.scenes[0].negative_prompt = "text, cartoon, 3D render, digital art, gore"
+    plan.scenes[0].forbidden_substitutions = ["3D digital rendering", "floating text"]
+
+    default = transform_visual_plan(
+        ProductionMode.CINEMATIC_STORY,
+        plan,
+        {"visual_style": "default"},
+    )
+    anime = transform_visual_plan(
+        ProductionMode.CINEMATIC_STORY,
+        plan,
+        {"visual_style": "anime"},
+    )
+
+    assert default.scenes[0].visual_style == original_style
+    assert default.creative_direction.visual_motif == "an inherited visual motif"
+    assert "LOCKED VISUAL STYLE FOR THE ENTIRE FILM" in anime.scenes[0].visual_style
+    assert "cinematic anime" in anime.scenes[0].visual_style
+    assert anime.creative_direction.visual_motif == "an inherited visual motif"
+    assert anime.scenes[0].visual_style in anime.scenes[0].prompt
+    assert "style drift" in anime.scenes[0].negative_prompt
+
+    pixar = transform_visual_plan(
+        ProductionMode.CINEMATIC_STORY,
+        plan,
+        {"visual_style": "pixar_style_3d"},
+    )
+    assert "3D render" not in pixar.scenes[0].negative_prompt
+    assert "digital art" not in pixar.scenes[0].negative_prompt
+    assert "cartoon" not in pixar.scenes[0].negative_prompt
+    assert "gore" in pixar.scenes[0].negative_prompt
+    assert pixar.scenes[0].forbidden_substitutions == ["floating text"]
+    assert "Pixar" not in pixar.scenes[0].visual_style
+
+    disney = transform_visual_plan(
+        ProductionMode.CINEMATIC_STORY,
+        plan,
+        {"visual_style": "disney_animation"},
+    )
+    assert "Disney" not in disney.scenes[0].visual_style
 
 
 def test_compiler_covers_narration_with_distinct_shots_of_at_most_eight_seconds() -> None:
@@ -59,9 +140,7 @@ def test_cinematic_plan_converts_informational_source_page_to_generated_video() 
         concept_visualization="Unchanged source slide with deadlines and approval thresholds.",
     )
 
-    result = _cinematic_visual_plan(
-        PresentationVisualPlan(scenes=[informational])
-    ).scenes[0]
+    result = _cinematic_visual_plan(PresentationVisualPlan(scenes=[informational])).scenes[0]
 
     assert result.media_mode == MediaMode.VIDEO
     assert result.preserve_source_frame is False
@@ -108,8 +187,7 @@ def test_compiler_assigns_each_action_once_and_carries_completed_state_forward()
         scene_number=1,
         source_slide_numbers=[1],
         narration=(
-            "Eirik empurra o barco. Em seguida pesca um peixe. "
-            "Por fim devolve o peixe à água."
+            "Eirik empurra o barco. Em seguida pesca um peixe. Por fim devolve o peixe à água."
         ),
         target_seconds=21,
         media_mode=MediaMode.VIDEO,
@@ -129,9 +207,9 @@ def test_compiler_assigns_each_action_once_and_carries_completed_state_forward()
 
     assert "EXCLUSIVE ACTION NOW: Eirik pushes the empty boat" in shots[0].prompt
     assert "ALREADY COMPLETED — NEVER REPEAT: Eirik pushes" in shots[1].prompt
-    assert "Eirik releases the fish" not in shots[1].prompt.split(
-        "SCENE WORLD AND CAST REFERENCE:"
-    )[0]
+    assert (
+        "Eirik releases the fish" not in shots[1].prompt.split("SCENE WORLD AND CAST REFERENCE:")[0]
+    )
     assert "Eirik releases the fish" in shots[2].prompt
     assert shots[1].continuity_in == shots[0].continuity_out
     assert "without reenacting it" in shots[0].continuity_out

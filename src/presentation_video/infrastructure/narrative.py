@@ -10,7 +10,9 @@ from pydantic_ai import Agent, UnexpectedModelBehavior
 
 from presentation_video.domain.errors import NarrativeDurationError, NarrativeGenerationError
 from presentation_video.domain.models import (
+    CharacterProfile,
     CreativeDirection,
+    DialogueLine,
     MediaMode,
     PresentationDocument,
     PresentationScript,
@@ -37,7 +39,14 @@ Rules:
 - Every scene must cite the source_slide_numbers that ground its narration.
 - Account for every source page: cite it in a scene or list it in omitted_source_slide_numbers when
   it is repetitive, administrative, empty, or irrelevant to the requested storytelling.
+- The input may include critical_information extracted before narrative compression. Every item
+  marked mandatory must remain explicit in the narration and must be cited through its source page.
+  Exact approval thresholds, deadlines, tables, and numeric rules outrank decorative context.
 - Use the requested language, audience, and tone.
+- Normally leave dialogue empty and write narration as voice-over. When the requested tone contains
+  "SPEECH MODE: CHARACTER DIALOGUE", do not use voice-over: populate every scene's dialogue in
+  speaking order, add a matching CharacterProfile to creative_direction.characters for every
+  character_id, and make narration the exact concatenation of the spoken dialogue text.
 - Each scene narration must stand alone enough to be regenerated independently.
 - Respect the speaking-rate budget supplied in the user prompt.
 - Use a concise short_caption that reinforces the main message of the scene.
@@ -74,6 +83,15 @@ Rules:
 """.strip()
 
 
+class _LLMDialogueLine(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    character_id: str = Field(min_length=1, max_length=60, pattern=r"^[a-z0-9_-]+$")
+    character_name: str = Field(min_length=1, max_length=80)
+    text: str = Field(min_length=1, max_length=1200)
+    emotion: str = Field(default="natural", min_length=1, max_length=80)
+
+
 class _LLMSceneScript(BaseModel):
     """Narrative fields owned by the LLM; timing deliberately belongs to the backend."""
 
@@ -82,6 +100,7 @@ class _LLMSceneScript(BaseModel):
     scene_number: int = Field(ge=1)
     source_slide_numbers: list[int] = Field(min_length=1)
     narration: str = Field(min_length=1)
+    dialogue: list[_LLMDialogueLine] = Field(default_factory=list)
     short_caption: str = Field(default="", max_length=160)
     media_mode: MediaMode
     story_beat: str = Field(min_length=1, max_length=120)
@@ -114,6 +133,9 @@ def _narrative_payload(
         "audience": audience,
         "tone": tone,
         "presentation_title": document.title,
+        "critical_information": [
+            unit.model_dump(mode="json") for unit in document.critical_information
+        ],
         "slides": [
             {
                 "slide_number": slide.number,
@@ -132,6 +154,7 @@ def _script_issues(
     document: PresentationDocument,
     target_seconds: int,
     words_per_minute: int,
+    dialogue_required: bool = False,
 ) -> list[str]:
     issues: list[str] = []
     expected_scene_numbers = list(range(1, len(script.scenes) + 1))
@@ -160,6 +183,7 @@ def _script_issues(
             issues.append("storyboard contains more than two consecutive video scenes")
             break
     valid_source_numbers = {slide.number for slide in document.slides}
+    known_character_ids = {character.id for character in script.creative_direction.characters}
     cited_source_numbers: set[int] = set()
     for scene in script.scenes:
         cited_source_numbers.update(scene.source_slide_numbers)
@@ -168,6 +192,19 @@ def _script_issues(
             issues.append(
                 f"scene {scene.scene_number} cites non-existent source slides {invalid_sources}"
             )
+        if dialogue_required:
+            if not scene.dialogue:
+                issues.append(
+                    f"scene {scene.scene_number} has no character dialogue; populate dialogue"
+                )
+                continue
+            dialogue_character_ids = {line.character_id for line in scene.dialogue}
+            missing_profiles = sorted(dialogue_character_ids - known_character_ids)
+            if missing_profiles:
+                issues.append(
+                    f"scene {scene.scene_number} dialogue uses character ids {missing_profiles} "
+                    "without matching creative_direction.characters profiles"
+                )
     omitted_source_numbers = set(script.omitted_source_slide_numbers)
     invalid_omissions = sorted(omitted_source_numbers - valid_source_numbers)
     if invalid_omissions:
@@ -236,6 +273,24 @@ def _compact_narration_to_budget(
         words = scene.narration.split()
         if len(words) <= budget:
             continue
+        if scene.dialogue:
+            remaining = budget
+            dialogue: list[_LLMDialogueLine] = []
+            for line in scene.dialogue:
+                if remaining <= 0:
+                    break
+                line_words = line.text.split()
+                kept_words = line_words[:remaining]
+                if not kept_words:
+                    continue
+                text = " ".join(kept_words)
+                if len(kept_words) < len(line_words):
+                    text = text.rstrip(".,;:") + "."
+                dialogue.append(line.model_copy(update={"text": text}))
+                remaining -= len(kept_words)
+            scene.dialogue = dialogue
+            scene.narration = " ".join(line.text for line in dialogue)
+            continue
         sentences = re.split(r"(?<=[.!?])\s+", scene.narration.strip())
         selected: list[str] = []
         selected_words = 0
@@ -289,6 +344,9 @@ def _build_script(generated: _LLMPresentationScript, target_seconds: int) -> Pre
                 scene_number=scene.scene_number,
                 source_slide_numbers=sorted(set(scene.source_slide_numbers)),
                 narration=scene.narration,
+                dialogue=[
+                    DialogueLine.model_validate(line.model_dump()) for line in scene.dialogue
+                ],
                 short_caption=scene.short_caption,
                 target_seconds=duration,
                 media_mode=scene.media_mode,
@@ -304,6 +362,23 @@ def _build_script(generated: _LLMPresentationScript, target_seconds: int) -> Pre
         omitted_source_slide_numbers=sorted(set(generated.omitted_source_slide_numbers)),
         total_estimated_seconds=target_seconds,
     )
+
+
+def _dialogue_mode(tone: str) -> bool:
+    return "SPEECH MODE: CHARACTER DIALOGUE" in tone
+
+
+def _normalize_dialogue_transcripts(
+    generated: _LLMPresentationScript,
+) -> _LLMPresentationScript:
+    scenes = []
+    for scene in generated.scenes:
+        if not scene.dialogue:
+            scenes.append(scene)
+            continue
+        transcript = " ".join(line.text.strip() for line in scene.dialogue if line.text.strip())
+        scenes.append(scene.model_copy(update={"narration": transcript}))
+    return generated.model_copy(update={"scenes": scenes})
 
 
 def _source_page_count(payload: dict[str, object]) -> int:
@@ -335,6 +410,9 @@ def _initial_prompt(payload: dict[str, object], target_seconds: int, words_per_m
         "Create an opening, a logical development, and a conclusion. Merge pages that support "
         "the same idea, skip repeated agendas/appendices, and preserve all facts needed for the "
         "story to remain faithful to the source.\n"
+        "Treat every mandatory critical_information item as non-omissible. Give exact-information "
+        "items a concise informational anchor instead of hiding them inside an unrelated moving "
+        "scene.\n"
         "Before the scenes, define creative_direction with one hook_question, a source-grounded "
         "throughline, central_thesis, narrative_device, recurring_visual_principle, visual_motif, "
         "restrained palette, one accent_color, pacing, and a reveal_scene_number. Add a "
@@ -496,6 +574,7 @@ class DebugNarrativeGenerator(NarrativeGenerator):
         target_words = max(scene_count, math.floor(maximum_words * 0.75))
         word_limits = _allocate_weighted_total(target_words, [1] * scene_count, 1)
         scenes: list[_LLMSceneScript] = []
+        dialogue_required = _dialogue_mode(tone)
 
         for index in range(scene_count):
             if len(document.slides) >= scene_count:
@@ -523,6 +602,28 @@ class DebugNarrativeGenerator(NarrativeGenerator):
                 prefix = "In this section, the document presents"
                 fallback = "the main elements of this part of the presentation"
             narration_words = f"{prefix} {normalized or fallback}".split()[: word_limits[index]]
+            narration = " ".join(narration_words).rstrip(".,;:") + "."
+            midpoint = max(1, len(narration_words) // 2)
+            dialogue = (
+                [
+                    _LLMDialogueLine(
+                        character_id="ana",
+                        character_name="Ana",
+                        text=" ".join(narration_words[:midpoint]).rstrip(".,;:") + ".",
+                        emotion="curious and engaged",
+                    ),
+                    _LLMDialogueLine(
+                        character_id="bruno",
+                        character_name="Bruno",
+                        text=" ".join(narration_words[midpoint:]).rstrip(".,;:") + ".",
+                        emotion="clear and confident",
+                    ),
+                ]
+                if dialogue_required and narration_words[midpoint:]
+                else []
+            )
+            if dialogue:
+                narration = " ".join(line.text for line in dialogue)
             is_last = index == scene_count - 1
             media_mode = (
                 MediaMode.VIDEO
@@ -534,7 +635,8 @@ class DebugNarrativeGenerator(NarrativeGenerator):
                 _LLMSceneScript(
                     scene_number=index + 1,
                     source_slide_numbers=[slide.number for slide in source_slides],
-                    narration=" ".join(narration_words).rstrip(".,;:") + ".",
+                    narration=narration,
+                    dialogue=dialogue,
                     short_caption=(titles[0] if titles else f"Cena {index + 1}")[:160],
                     media_mode=media_mode,
                     story_beat=story_beat,
@@ -588,6 +690,32 @@ class DebugNarrativeGenerator(NarrativeGenerator):
                     narrative_device="Progressão do contexto para a decisão",
                     recurring_visual_principle=(
                         "Cada cena acrescenta uma evidência concreta até a decisão final"
+                    ),
+                    characters=(
+                        [
+                            CharacterProfile(
+                                id="ana",
+                                narrative_role="Raises the audience's practical questions",
+                                physical_appearance=(
+                                    "Adult woman with shoulder-length dark curly hair and warm "
+                                    "brown eyes"
+                                ),
+                                wardrobe="Terracotta jacket over a cream shirt",
+                                identity_markers=["dark curly hair", "terracotta jacket"],
+                            ),
+                            CharacterProfile(
+                                id="bruno",
+                                narrative_role="Connects evidence to the decision",
+                                physical_appearance=(
+                                    "Adult man with short black hair, rectangular face, and "
+                                    "dark brown eyes"
+                                ),
+                                wardrobe="Charcoal overshirt over a light neutral shirt",
+                                identity_markers=["short black hair", "charcoal overshirt"],
+                            ),
+                        ]
+                        if dialogue_required
+                        else []
                     ),
                 ),
                 scenes=scenes,
@@ -651,8 +779,16 @@ class PydanticAINarrativeGenerator(NarrativeGenerator):
                 "Não foi possível estruturar o roteiro automaticamente. Tente novamente.",
             ) from exc
         script = result.output
+        dialogue_required = _dialogue_mode(tone)
+        script = _normalize_dialogue_transcripts(script)
         for revision in range(self._max_revisions + 1):
-            issues = _script_issues(script, document, target_seconds, self._words_per_minute)
+            issues = _script_issues(
+                script,
+                document,
+                target_seconds,
+                self._words_per_minute,
+                dialogue_required=dialogue_required,
+            )
             if self._allow_duration_review and _only_word_budget_issue(issues):
                 word_count = sum(len(scene.narration.split()) for scene in script.scenes)
                 estimated_seconds = math.ceil(word_count * 60 / self._words_per_minute)
@@ -699,7 +835,7 @@ class PydanticAINarrativeGenerator(NarrativeGenerator):
                     f"Pydantic AI could not revise structured narrative output: {exc}",
                     "Não foi possível corrigir o roteiro automaticamente. Tente novamente.",
                 ) from exc
-            script = result.output
+            script = _normalize_dialogue_transcripts(result.output)
         raise RuntimeError("Unreachable narrative revision state")
 
 
@@ -731,6 +867,7 @@ class ReplicateNarrativeGenerator(NarrativeGenerator):
         tone: str,
     ) -> PresentationScript:
         payload = _narrative_payload(document, target_seconds, language, audience, tone)
+        dialogue_required = _dialogue_mode(tone)
         maximum_words = math.floor(target_seconds * self._words_per_minute / 60)
         logger.info(
             "narrative generation started provider=replicate model=%s target_seconds=%s "
@@ -764,7 +901,14 @@ class ReplicateNarrativeGenerator(NarrativeGenerator):
                 )
                 prompt = _structured_revision_prompt(failed_prompt, text, summary, schema)
                 continue
-            issues = _script_issues(script, document, target_seconds, self._words_per_minute)
+            script = _normalize_dialogue_transcripts(script)
+            issues = _script_issues(
+                script,
+                document,
+                target_seconds,
+                self._words_per_minute,
+                dialogue_required=dialogue_required,
+            )
             if self._allow_duration_review and _only_word_budget_issue(issues):
                 word_count = sum(len(scene.narration.split()) for scene in script.scenes)
                 estimated_seconds = math.ceil(word_count * 60 / self._words_per_minute)

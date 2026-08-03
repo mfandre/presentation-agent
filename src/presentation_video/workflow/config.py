@@ -31,6 +31,10 @@ class WorkflowRuntimeConfig:
         except KeyError as error:
             raise ValueError(f"workflow is missing required step {step_id!r}") from error
 
+    def optional(self, step_id: str) -> dict[str, Any]:
+        step = self._steps.get(step_id)
+        return step.config if step is not None else {}
+
     def step(self, step_id: str) -> StepRuntimeConfig:
         config = self.raw(step_id)
         if not config:

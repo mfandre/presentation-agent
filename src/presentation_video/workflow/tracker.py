@@ -22,6 +22,8 @@ _STATUS_TO_STEP: dict[JobStatus, str] = {
     JobStatus.VISUAL_PLANNING: "visual_plan",
     JobStatus.PROMPT_COMPILING: "prompt_compile",
     JobStatus.RULE_VALIDATING: "rule_validate",
+    JobStatus.DESIGNING_CHARACTERS: "character_references",
+    JobStatus.STORYBOARDING: "storyboard",
     JobStatus.GENERATING_IMAGES: "generate_images",
     JobStatus.AWAITING_VISUAL_APPROVAL: "visual_review",
     JobStatus.GENERATING_VIDEO: "animate",
@@ -132,6 +134,8 @@ class WorkflowJobTracker:
             )
         elif status == JobStatus.GENERATING_VIDEO and is_whiteboard:
             step_id = "whiteboard_animate"
+        elif status == JobStatus.GENERATING_VIDEO and production_mode == "cinematic_story":
+            step_id = "storyboard_animate"
         if step_id is None or step_id not in order:
             return
         target_index = order.index(step_id)

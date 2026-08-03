@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import mimetypes
 from pathlib import Path
 
@@ -9,13 +10,20 @@ from presentation_video.domain.models import (
     MediaMode,
     SlideContent,
     VisualArtifact,
+    VisualGenerationPurpose,
     VisualScenePlan,
+    VideoGeneratorCapabilities,
 )
 from presentation_video.infrastructure.process import run_process
 from presentation_video.infrastructure.replicate import ReplicatePredictionClient
 from presentation_video.infrastructure.concept_grounding import (
     default_concept_visualization,
     infer_required_concepts,
+)
+from presentation_video.infrastructure.video_capabilities import (
+    video_model_capabilities,
+    video_model_last_frame_input_key,
+    video_model_output_duration,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +55,21 @@ _SAFE_VISUAL_POLICY = (
 
 
 def _visual_prompt(plan: VisualScenePlan, source_slides: list[SlideContent] | None = None) -> str:
+    if plan.generation_purpose == VisualGenerationPurpose.CHARACTER_REFERENCE:
+        return (
+            f"{plan.prompt} "
+            "This is a fictional production-design reference for benign visual storytelling. "
+            "Keep the four views consistent and isolated on the requested neutral background. "
+            "Do not include typography, labels, logos, watermarks, props, additional people, "
+            "weapons, injuries, nudity, hateful symbols, or unsafe activity."
+        )
+    if plan.generation_purpose == VisualGenerationPurpose.STORYBOARD:
+        return (
+            f"{plan.prompt} "
+            "This is a benign pre-production storyboard. Preserve causal continuity and canonical "
+            "character identities across every cell. Do not include typography, captions, labels, "
+            "logos, watermarks, graphic injury, weapons, nudity, hateful symbols, or unsafe acts."
+        )
     source_context = ""
     grounded_text = ""
     if source_slides:
@@ -159,10 +182,12 @@ class ReplicateImageAssetGenerator:
         client: ReplicatePredictionClient,
         model: str,
         input_defaults: dict[str, object] | None = None,
+        reference_input_key: str | None = None,
     ) -> None:
         self._client = client
         self._model = model
         self._input_defaults = input_defaults or {}
+        self._reference_input_key = reference_input_key
 
     async def generate(
         self,
@@ -173,10 +198,28 @@ class ReplicateImageAssetGenerator:
     ) -> VisualArtifact:
         if plan.media_mode == MediaMode.STATIC and plan.preserve_source_frame:
             raise ValueError("Preserved static scenes must use an unchanged source page")
-        output = await self._client.run(
-            self._model,
-            {**self._input_defaults, "prompt": _visual_prompt(plan, source_slides)},
-        )
+        inputs: dict[str, object] = {
+            **self._input_defaults,
+            "prompt": _visual_prompt(plan, source_slides),
+        }
+        if plan.generation_purpose in {
+            VisualGenerationPurpose.CHARACTER_REFERENCE,
+            VisualGenerationPurpose.STORYBOARD,
+        }:
+            # A square grid only preserves 16:9 inside every cell when the complete sheet is 16:9.
+            inputs["aspect_ratio"] = "16:9"
+        if self._reference_input_key:
+            reference_images = [
+                slide.image_path
+                for slide in source_slides
+                if slide.title.startswith("Character identity reference")
+                and slide.image_path.is_file()
+            ]
+            if reference_images:
+                inputs[self._reference_input_key] = [
+                    _image_data_url(path) for path in reference_images
+                ]
+        output = await self._client.run(self._model, inputs)
         url = self._client.output_url(output)
         suffix = Path(url.split("?", 1)[0]).suffix.lower()
         if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -196,6 +239,12 @@ class ReplicateImageAssetGenerator:
         )
 
 
+def _image_data_url(path: Path) -> str:
+    mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
 class ReplicateVideoAssetGenerator:
     """Animates an approved image using an image-to-video model on Replicate."""
 
@@ -211,6 +260,10 @@ class ReplicateVideoAssetGenerator:
         self._image_input_key = image_input_key
         self._input_defaults = _sanitize_video_inputs(model, input_defaults or {})
 
+    @property
+    def capabilities(self) -> VideoGeneratorCapabilities:
+        return video_model_capabilities(self._model)
+
     async def animate(
         self,
         plan: VisualScenePlan,
@@ -220,7 +273,11 @@ class ReplicateVideoAssetGenerator:
     ) -> VisualArtifact:
         if plan.media_mode != MediaMode.VIDEO:
             raise ValueError("Static scenes must bypass image-to-video")
-        input_path = image.path
+        capabilities = self.capabilities
+        first_frame_path = image.start_path or image.path
+        if not first_frame_path.is_file() or first_frame_path.stat().st_size == 0:
+            raise ValueError(f"First frame does not exist or is empty: {first_frame_path}")
+        input_path = first_frame_path
         target_dimensions = {
             "16:9": (1280, 720),
             "9:16": (720, 1280),
@@ -254,9 +311,23 @@ class ReplicateVideoAssetGenerator:
         mime_type = mimetypes.guess_type(input_path.name)[0] or "image/png"
         encoded = base64.b64encode(input_path.read_bytes()).decode("ascii")
         data_url = f"data:{mime_type};base64,{encoded}"
+        last_frame_input_key = video_model_last_frame_input_key(self._model)
+        has_last_frame = (
+            image.start_path is not None
+            and capabilities.supports_last_frame
+            and last_frame_input_key is not None
+        )
+        frame_contract = (
+            "The first supplied image is the exact opening frame and the last supplied image is "
+            "the exact ending frame. Create a natural continuous transition between them without "
+            "restarting or completing the ending action early. "
+            if has_last_frame
+            else ""
+        )
         inputs = {
             **self._input_defaults,
             "prompt": (
+                f"{frame_contract}"
                 f"{plan.camera_motion}. Animate the approved input image faithfully at a natural, "
                 "normal speed. Preserve the same location, subjects, clothing, equipment, layout, "
                 "lighting, palette, and action visible in the input image. Do not introduce any new "
@@ -269,6 +340,12 @@ class ReplicateVideoAssetGenerator:
             ),
             self._image_input_key: data_url,
         }
+        requested_duration = video_model_output_duration(self._model, duration_seconds)
+        if requested_duration is not None:
+            inputs["duration"] = requested_duration
+        if has_last_frame:
+            assert last_frame_input_key is not None
+            inputs[last_frame_input_key] = _image_data_url(image.path)
         try:
             output = await self._client.run(self._model, inputs)
         except RuntimeError as exc:
@@ -282,7 +359,7 @@ class ReplicateVideoAssetGenerator:
             )
             return await FfmpegImageAnimator().animate(
                 plan,
-                image,
+                image.model_copy(update={"path": first_frame_path, "start_path": None}),
                 output_dir,
                 duration_seconds,
             )
@@ -303,6 +380,101 @@ class ReplicateVideoAssetGenerator:
             kind="video",
             revision=image.revision,
         )
+
+    async def animate_storyboard(
+        self,
+        plans: list[VisualScenePlan],
+        storyboard: VisualArtifact,
+        output_dir: Path,
+        duration_seconds: float,
+        segment_number: int,
+    ) -> VisualArtifact:
+        capabilities = self.capabilities
+        if not capabilities.supports_storyboard_reference or not capabilities.supports_multishot:
+            raise ValueError(f"Model {self._model!r} does not support storyboard multi-shot input")
+        if not plans or any(plan.media_mode != MediaMode.VIDEO for plan in plans):
+            raise ValueError("Storyboard animation requires one or more dynamic shot plans")
+        if not storyboard.path.is_file() or storyboard.path.stat().st_size == 0:
+            raise ValueError(f"Storyboard does not exist or is empty: {storyboard.path}")
+        if duration_seconds > capabilities.maximum_output_seconds + 0.001:
+            raise ValueError(
+                f"Storyboard segment duration {duration_seconds:.2f}s exceeds the model maximum "
+                f"of {capabilities.maximum_output_seconds:.2f}s"
+            )
+
+        inputs = {
+            key: value
+            for key, value in self._input_defaults.items()
+            if key not in {self._image_input_key, "image", "last_frame", "last_frame_image"}
+        }
+        inputs.update(
+            {
+                "prompt": _replicate_storyboard_prompt(plans),
+                "reference_images": [_image_data_url(storyboard.path)],
+                "duration": min(
+                    max(
+                        math.ceil(duration_seconds),
+                        math.ceil(capabilities.minimum_output_seconds),
+                    ),
+                    math.floor(capabilities.maximum_output_seconds),
+                ),
+                "generate_audio": False,
+            }
+        )
+        output = await self._client.run(self._model, inputs)
+        url = self._client.output_url(output)
+        suffix = Path(url.split("?", 1)[0]).suffix.lower()
+        if suffix not in {".mp4", ".webm", ".mov"}:
+            suffix = ".mp4"
+        destination = output_dir / (
+            f"scene-{storyboard.scene_number:03d}-storyboard-segment-"
+            f"{segment_number:03d}{suffix}"
+        )
+        await self._client.download(url, destination)
+        if not destination.is_file() or destination.stat().st_size == 0:
+            raise RuntimeError(
+                f"Replicate returned an empty storyboard video for scene "
+                f"{storyboard.scene_number}"
+            )
+        return VisualArtifact(
+            scene_number=storyboard.scene_number,
+            shot_number=storyboard.shot_number,
+            path=destination,
+            kind="video",
+            revision=storyboard.revision,
+        )
+
+
+def _replicate_storyboard_prompt(
+    plans: list[VisualScenePlan],
+) -> str:
+    has_dialogue = any("DIALOGUE PERFORMANCE:" in plan.prompt for plan in plans)
+    directions = []
+    for index, plan in enumerate(plans, start=1):
+        directions.append(
+            f"Shot {index}: {plan.focal_action}; camera {plan.camera_motion}; "
+            f"enter from {plan.entrance_motion}; end in {plan.transition_out}; "
+            f"locked visual style={plan.visual_style}."
+        )
+    return (
+        "[Image1] is a clean storyboard grid, read left-to-right and top-to-bottom. Animate it as "
+        "one continuous cinematic multi-shot sequence. Each storyboard cell is a successive shot, "
+        "never a collage in the output. Hide all grid borders. Use motivated cuts and continuous "
+        "causal action. Never restart, repeat, reverse, or prematurely complete an action. Preserve "
+        "environment, props, screen direction, lighting, palette, rendering medium, art style, "
+        "spatial state, and every "
+        "character identity already established inside the storyboard between shots. Use natural "
+        "normal-speed motion. "
+        "No slow motion or generated audio. "
+        + (
+            "Perform the explicitly scripted dialogue through natural speaker mouth movement, "
+            "body language, and listener reactions; do not invent additional lines. "
+            if has_dialogue
+            else "Do not make characters appear to speak or hold a conversation. "
+        )
+        + "No text, captions, titles, labels, logos, interfaces, or "
+        f"watermarks. {' '.join(directions)}"
+    )[:4_000]
 
 
 def _sanitize_video_inputs(

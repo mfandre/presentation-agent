@@ -65,6 +65,7 @@ class EspeakSpeechSynthesizer(SpeechSynthesizer):
         output_path: Path,
         language: str | None = None,
         style: str | None = None,
+        voice: str | None = None,
     ) -> AudioArtifact:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         await run_process(
@@ -107,11 +108,12 @@ class ReplicateTTSSynthesizer(SpeechSynthesizer):
         output_path: Path,
         language: str | None = None,
         style: str | None = None,
+        voice: str | None = None,
     ) -> AudioArtifact:
         inputs = {
             **self._input_defaults,
             "text": text,
-            "voice": self._voice,
+            "voice": voice or self._voice,
             "prompt": _delivery_prompt(self._style_prompt, style),
             "language_code": language or self._language_code,
         }
@@ -188,6 +190,7 @@ class PydanticAIGoogleTTSSynthesizer(SpeechSynthesizer):
         output_path: Path,
         language: str | None = None,
         style: str | None = None,
+        voice: str | None = None,
     ) -> AudioArtifact:
         spoken_language = language or self._language_code
         instruction = (
@@ -202,7 +205,7 @@ class PydanticAIGoogleTTSSynthesizer(SpeechSynthesizer):
                     "tts generation started provider=pydantic_ai model=%s voice=%s "
                     "language=%s text_characters=%s attempt=%s",
                     self._model,
-                    self._voice,
+                    voice or self._voice,
                     spoken_language,
                     len(text),
                     attempt + 1,
@@ -214,7 +217,7 @@ class PydanticAIGoogleTTSSynthesizer(SpeechSynthesizer):
                         input=instruction,
                         stream=False,
                         response_format={"type": "audio"},
-                        generation_config={"speech_config": [{"voice": self._voice}]},
+                        generation_config={"speech_config": [{"voice": voice or self._voice}]},
                     ),
                 )
                 audio = interaction.output_audio

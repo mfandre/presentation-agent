@@ -1,4 +1,4 @@
-import { ChevronDown, Clock3, Film, GraduationCap, History, Mic2, PenTool, Presentation, Sparkles, WandSparkles } from "lucide-react";
+import { ChevronDown, CircleHelp, Clock3, Film, GraduationCap, History, Mic2, PenTool, Presentation, Sparkles, WandSparkles } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 
 import type { CreateVideoInput, ProductionMode, ProductionPreset } from "../api/contracts";
@@ -43,7 +43,37 @@ const FALLBACK_PRESETS: ProductionPreset[] = [
     icon: "film",
     strategy: "cinematic",
     narrative_direction: "",
-    options: [],
+    options: [
+      {
+        id: "speech_mode",
+        label: "Voz do vídeo",
+        type: "select",
+        default: "narration",
+        choices: [
+          { value: "narration", label: "Narração" },
+          { value: "character_dialogue", label: "Diálogo entre personagens" },
+        ],
+      },
+      {
+        id: "visual_style",
+        label: "Visual style",
+        type: "select",
+        default: "default",
+        choices: [
+          { value: "default", label: "Default — realistic editorial documentary" },
+          { value: "disney_animation", label: "Disney animation" },
+          { value: "pixar_style_3d", label: "Pixar-style 3D" },
+          { value: "anime", label: "Anime" },
+          { value: "live_action", label: "Live action" },
+          { value: "stylized_3d", label: "Stylized 3D" },
+          { value: "comic_book", label: "Comic book" },
+          { value: "fantasy", label: "Fantasy" },
+          { value: "sci_fi", label: "Sci-fi" },
+          { value: "horror", label: "Horror" },
+          { value: "stop_motion", label: "Stop motion" },
+        ],
+      },
+    ],
   },
   {
     id: "corporate_training",
@@ -218,7 +248,17 @@ export function ConfigurationForm({
           </label>
 
           <label className="field">
-            <span><Sparkles size={16} /> Público</span>
+            <span>
+              <Sparkles size={16} /> Público
+              <span
+                className="field-help"
+                data-tooltip={"Executiva — destaca decisões, impacto, riscos e resultados.\nTécnica — usa mais detalhes, conceitos e precisão operacional.\nComercial — enfatiza valor, benefícios e poder de convencimento.\nTreinamento — prioriza clareza, exemplos e aplicação prática."}
+                aria-label="Diferenças entre os públicos: Executiva destaca decisões e resultados; Técnica prioriza detalhes e precisão; Comercial enfatiza valor e convencimento; Treinamento prioriza clareza e aplicação prática."
+                tabIndex={0}
+              >
+                <CircleHelp size={14} />
+              </span>
+            </span>
             <div className="select-wrap">
               <select value={audience} onChange={(event) => setAudience(event.target.value)} disabled={disabled}>
                 {AUDIENCES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
@@ -229,7 +269,17 @@ export function ConfigurationForm({
         </div>
 
         <label className="field">
-          <span><WandSparkles size={16} /> Tom da apresentação</span>
+          <span>
+            <WandSparkles size={16} /> Tom da apresentação
+            <span
+              className="field-help"
+              data-tooltip={"Profissional e natural — equilibrado, fluido e institucional sem soar rígido.\nConciso e objetivo — frases diretas, menos contexto e foco no essencial.\nEnvolvente e persuasivo — cria interesse e reforça argumentos e benefícios.\nDidático e acessível — explica conceitos gradualmente com linguagem simples."}
+              aria-label="Diferenças entre os tons: Profissional e natural é equilibrado e fluido; Conciso e objetivo foca no essencial; Envolvente e persuasivo reforça argumentos; Didático e acessível explica gradualmente com linguagem simples."
+              tabIndex={0}
+            >
+              <CircleHelp size={14} />
+            </span>
+          </span>
           <div className="select-wrap">
             <select value={tone} onChange={(event) => setTone(event.target.value)} disabled={disabled}>
               {TONES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
@@ -258,7 +308,11 @@ export function ConfigurationForm({
 
       <button type="submit" className="primary-button" disabled={disabled}>
         <WandSparkles size={19} />
-        {disabled ? "Iniciando processamento…" : "Criar vídeo narrado"}
+        {disabled
+          ? "Iniciando processamento…"
+          : productionMode === "cinematic_story" && presetOptions.speech_mode === "character_dialogue"
+            ? "Criar vídeo com diálogos"
+            : "Criar vídeo narrado"}
       </button>
       <p className="form-footnote">O arquivo é processado cena a cena para permitir retries e edição isolada.</p>
     </form>

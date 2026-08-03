@@ -59,6 +59,15 @@ def write_job_manifest(
         "approved_images": [
             image.model_dump(mode="json") for image in prepared.visual_images
         ],
+        "character_references": [
+            reference.model_dump(mode="json")
+            for reference in prepared.character_references
+        ],
+        "generated_storyboard": (
+            prepared.storyboard.model_dump(mode="json")
+            if prepared.storyboard is not None
+            else None
+        ),
         "storyboard": [
             plan.model_dump(mode="json") for plan in prepared.visual_plan.scenes
         ],

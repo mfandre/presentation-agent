@@ -9,6 +9,8 @@ export type JobStatus =
   | "visual_planning"
   | "prompt_compiling"
   | "rule_validating"
+  | "designing_characters"
+  | "storyboarding"
   | "generating_images"
   | "awaiting_visual_approval"
   | "generating_video"
@@ -51,6 +53,19 @@ export interface VideoJob {
   creative_direction: CreativeDirection | null;
   brand_kit: BrandKit | null;
   source_pages: SourcePage[];
+  character_references: CharacterReference[];
+  storyboard_sheets: StoryboardSheet[];
+}
+
+export interface CharacterReference {
+  character_id: string;
+  image_url: string;
+}
+
+export interface StoryboardSheet {
+  sheet_number: number;
+  image_url: string;
+  panel_numbers: number[];
 }
 
 export interface SourcePage {
@@ -166,6 +181,8 @@ export interface SceneImage {
   instructional_type: "concept" | "process" | "rule" | "behavior" | "system_demo" | "recap" | null;
   learning_objective: string;
   allow_readable_text: boolean;
+  locked_static: boolean;
+  critical_information_titles: string[];
 }
 
 export interface VisualBeat {
@@ -211,6 +228,7 @@ export type WorkflowStepStatus =
 export interface WorkflowStepDefinition {
   id: string;
   uses: string;
+  description: string;
   needs: string[];
   inputs: Record<string, unknown>;
   config: Record<string, unknown>;
